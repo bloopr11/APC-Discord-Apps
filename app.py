@@ -1,5 +1,3 @@
-import matplotlib
-matplotlib.use("Agg")
 import discord
 from discord import app_commands
 import asyncio
@@ -7,7 +5,8 @@ import os
 import random
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")
 from datetime import datetime
 
 # ======================
