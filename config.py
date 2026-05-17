@@ -1,6 +1,10 @@
-DISCORD_TOKEN = "MTUwNTYyNzgyOTcyMTc1OTgxNg.GzkHzE.D9gNhYv_d-ZtIXJc32i5r4GXUEvyr4fCV27jcw"
-CHANNEL_ID = 1505312909624869066
+import os
 
-PAIR_LIST = ["XAUUSD", "BTCUSD"]
+# Discord
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-TIMEFRAME = "15M"
+# Trading config
+PAIR_LIST = os.getenv("PAIR_LIST", "XAUUSD,BTCUSD").split(",")
+
+TIMEFRAME = os.getenv("TIMEFRAME", "15M")
