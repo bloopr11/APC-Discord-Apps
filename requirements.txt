@@ -1,4 +1,5 @@
 discord.py==2.3.2
-numpy
 pandas
+numpy
 matplotlib
+yfinance
