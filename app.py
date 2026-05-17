@@ -2,280 +2,514 @@ import discord
 from discord import app_commands
 import asyncio
 import os
-import numpy as np
 import pandas as pd
+import numpy as np
 import yfinance as yf
 
 import matplotlib
 matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 
-# =========================
+# ==================================================
 # ENV
-# =========================
+# ==================================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
+# ==================================================
+# PAIRS
+# ==================================================
 PAIRS = {
     "BTCUSD": "BTC-USD",
     "ETHUSD": "ETH-USD",
+    "XAUUSD": "GC=F",
     "XRPUSD": "XRP-USD",
     "SOLUSD": "SOL-USD",
-    "XAUUSD": "GC=F"
+    "ADAUSD": "ADA-USD",
+    "DOGEUSD": "DOGE-USD"
 }
 
 TIMEFRAME = "5m"
 AUTO_SIGNAL = False
 
-# =========================
+# ==================================================
 # DISCORD CLIENT
-# =========================
+# ==================================================
 class Bot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
 client = Bot()
 
-# =========================
-# DATA
-# =========================
+# ==================================================
+# GET MARKET DATA
+# ==================================================
 def get_data(symbol):
-    df = yf.download(symbol, period="5d", interval="15m")
+
+    df = yf.download(
+        symbol,
+        period="5d",
+        interval="15m",
+        auto_adjust=True,
+        progress=False
+    )
+
     df = df.dropna()
+
+    # FIX multi index
+    df.columns = [
+        col[0] if isinstance(col, tuple) else col
+        for col in df.columns
+    ]
+
     return df
 
-# =========================
+# ==================================================
 # INDICATORS
-# =========================
-def ema(s, p):
-    return s.ewm(span=p).mean()
+# ==================================================
+def ema(series, period):
+    return series.ewm(span=period).mean()
 
-def rsi(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = -d.clip(upper=0).rolling(p).mean()
-    rs = g / l
+def rsi(series, period=14):
+
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+
     return 100 - (100 / (1 + rs))
 
-def macd(s):
-    m1 = ema(s, 12)
-    m2 = ema(s, 26)
-    macd = m1 - m2
-    sig = ema(macd, 9)
-    return macd, sig
+def macd(series):
 
-# =========================
-# SMC
-# =========================
+    ema12 = ema(series, 12)
+    ema26 = ema(series, 26)
+
+    macd_line = ema12 - ema26
+    signal = ema(macd_line, 9)
+
+    return macd_line, signal
+
+# ==================================================
+# SMC ENGINE
+# ==================================================
 def smc(df):
-    last = df.iloc[-1]
 
-    bos = last["Close"] > df["High"].rolling(10).max().iloc[-2]
-    choch = last["Close"] < df["Low"].rolling(10).min().iloc[-2]
-    liq = last["High"] > df["High"].rolling(20).max().iloc[-2]
+    bos = (
+        df["Close"].iloc[-1]
+        > df["High"].rolling(10).max().iloc[-2]
+    )
 
-    return {"BOS": bool(bos), "CHoCH": bool(choch), "LIQ": bool(liq)}
+    choch = (
+        df["Close"].iloc[-1]
+        < df["Low"].rolling(10).min().iloc[-2]
+    )
 
-# =========================
-# LIQUIDITY
-# =========================
-def liquidity(df):
-    high = df["High"].rolling(20).max().iloc[-1]
-    low = df["Low"].rolling(20).min().iloc[-1]
-    price = df["Close"].iloc[-1]
+    liq = (
+        df["High"].iloc[-1]
+        > df["High"].rolling(20).max().iloc[-2]
+    )
 
     return {
-        "HIGH": high,
-        "LOW": low,
-        "PRESSURE": "BUY" if abs(price-low) < abs(price-high) else "SELL"
+        "BOS": bos,
+        "CHoCH": choch,
+        "LIQ": liq
     }
 
-# =========================
+# ==================================================
+# LIQUIDITY
+# ==================================================
+def liquidity(df):
+
+    high_zone = df["High"].rolling(20).max().iloc[-1]
+    low_zone = df["Low"].rolling(20).min().iloc[-1]
+
+    price = df["Close"].iloc[-1]
+
+    pressure = (
+        "BUY"
+        if abs(price - low_zone) < abs(price - high_zone)
+        else "SELL"
+    )
+
+    return {
+        "HIGH_ZONE": high_zone,
+        "LOW_ZONE": low_zone,
+        "PRESSURE": pressure
+    }
+
+# ==================================================
 # FLOW
-# =========================
+# ==================================================
 def flow(df):
+
     momentum = df["Close"].diff().mean()
+
     return {
         "FLOW": "BUY" if momentum > 0 else "SELL",
         "STRENGTH": abs(momentum) * 100
     }
 
-# =========================
-# LSTM (SIMPLIFIED)
-# =========================
-def lstm(df):
-    return "BULLISH" if df["Close"].iloc[-1] > df["Close"].mean() else "BEARISH"
+# ==================================================
+# LSTM PROXY
+# ==================================================
+def lstm_prediction(df):
 
-# =========================
+    current = df["Close"].iloc[-1]
+    mean_price = df["Close"].mean()
+
+    return "BULLISH" if current > mean_price else "BEARISH"
+
+# ==================================================
 # AI SCORE
-# =========================
-def score(l, s, liq, fl):
-    sc = 50
+# ==================================================
+def ai_score(lstm, smc_data, liq, fl):
 
-    if l == "BULLISH": sc += 20
-    else: sc -= 20
+    score = 50
 
-    if s["BOS"]: sc += 10
-    if s["LIQ"]: sc += 10
-    if s["CHoCH"]: sc -= 10
+    # LSTM
+    if lstm == "BULLISH":
+        score += 20
+    else:
+        score -= 20
 
-    if liq["PRESSURE"] == "BUY": sc += 10
-    else: sc -= 10
+    # SMC
+    if smc_data["BOS"]:
+        score += 10
 
-    if fl["FLOW"] == "BUY": sc += 10
-    else: sc -= 10
+    if smc_data["LIQ"]:
+        score += 10
 
-    return max(0, min(100, sc))
+    if smc_data["CHoCH"]:
+        score -= 10
 
-# =========================
+    # Liquidity
+    if liq["PRESSURE"] == "BUY":
+        score += 10
+    else:
+        score -= 10
+
+    # Flow
+    if fl["FLOW"] == "BUY":
+        score += 10
+    else:
+        score -= 10
+
+    return max(0, min(100, score))
+
+# ==================================================
 # GENERATE SIGNAL
-# =========================
-def generate(pair):
+# ==================================================
+def generate_signal(pair):
+
     df = get_data(PAIRS[pair])
+
     close = df["Close"]
 
-    r = rsi(close).iloc[-1]
-    m1, m2 = macd(close)
-    m = m1.iloc[-1] - m2.iloc[-1]
+    # indicators
+    rsi_value = rsi(close).iloc[-1]
 
-    s = smc(df)
+    macd_line, macd_signal = macd(close)
+
+    macd_value = (
+        macd_line.iloc[-1]
+        - macd_signal.iloc[-1]
+    )
+
+    # AI engines
+    smc_data = smc(df)
     liq = liquidity(df)
     fl = flow(df)
-    l = lstm(df)
+    lstm = lstm_prediction(df)
 
-    sc = score(l, s, liq, fl)
+    score = ai_score(
+        lstm,
+        smc_data,
+        liq,
+        fl
+    )
+
+    action = "BUY" if score >= 55 else "SELL"
 
     price = float(close.iloc[-1])
 
+    tp = (
+        price + (price * 0.01)
+        if action == "BUY"
+        else price - (price * 0.01)
+    )
+
+    sl = (
+        price - (price * 0.01)
+        if action == "BUY"
+        else price + (price * 0.01)
+    )
+
     return {
         "pair": pair,
-        "score": sc,
-        "lstm": l,
-        "rsi": r,
-        "macd": m,
-        "smc": s,
+        "score": score,
+        "action": action,
+        "entry": price,
+        "tp": tp,
+        "sl": sl,
+        "rsi": rsi_value,
+        "macd": macd_value,
+        "lstm": lstm,
+        "smc": smc_data,
         "liq": liq,
         "flow": fl,
-        "entry": price,
-        "tp": price + (price * 0.01),
-        "sl": price - (price * 0.01)
+        "df": df
     }
 
-# =========================
-# FORMAT
-# =========================
-def fmt(d):
+# ==================================================
+# FORMAT MESSAGE
+# ==================================================
+def format_signal(data):
+
     return f"""
-📊 {d['pair']} AI INSTITUTIONAL SIGNAL
+📊 {data['pair']} AI INSTITUTIONAL SIGNAL
 
-🧠 SCORE: {d['score']}%
+🧠 AI SCORE: {data['score']}%
 
-📈 LSTM: {d['lstm']}
-📊 RSI: {d['rsi']:.2f}
-📊 MACD: {d['macd']:.2f}
+📈 LSTM: {data['lstm']}
+📊 RSI: {data['rsi']:.2f}
+📊 MACD: {data['macd']:.2f}
 
-🏗 BOS: {d['smc']['BOS']}
-🔄 CHoCH: {d['smc']['CHoCH']}
-💧 LIQ: {d['smc']['LIQ']}
+🏗 BOS: {data['smc']['BOS']}
+🔄 CHoCH: {data['smc']['CHoCH']}
+💧 LIQ: {data['smc']['LIQ']}
 
-💧 Pressure: {d['liq']['PRESSURE']}
-🏦 Flow: {d['flow']['FLOW']} ({d['flow']['STRENGTH']:.2f})
+💧 Pressure: {data['liq']['PRESSURE']}
+🏦 Flow: {data['flow']['FLOW']}
 
-🟢 ENTRY: {d['entry']}
-🎯 TP: {d['tp']}
-🛑 SL: {d['sl']}
+🟢 ACTION: {data['action']}
+
+📍 ENTRY: {data['entry']:.4f}
+🎯 TP: {data['tp']:.4f}
+🛑 SL: {data['sl']:.4f}
+
+⏱ TF: {TIMEFRAME}
 """
 
-# =========================
-# CHART 5M ZONE
-# =========================
-def chart(df, pair, entry, tp, sl):
-    plt.figure(figsize=(10,4))
-    plt.plot(df["Close"], label="Price")
+# ==================================================
+# CREATE CHART
+# ==================================================
+def create_chart(df, pair, entry, tp, sl):
 
-    plt.axhline(entry, linestyle="--", color="blue")
-    plt.axhline(tp, linestyle="--", color="green")
-    plt.axhline(sl, linestyle="--", color="red")
+    plt.figure(figsize=(12, 5))
 
-    plt.title(f"{pair} 5M ENTRY ZONE")
+    plt.plot(df["Close"], linewidth=2)
 
-    file = f"{pair}_signal.png"
-    plt.savefig(file)
+    plt.axhline(
+        entry,
+        linestyle="--",
+        label="ENTRY"
+    )
+
+    plt.axhline(
+        tp,
+        linestyle="--",
+        label="TP"
+    )
+
+    plt.axhline(
+        sl,
+        linestyle="--",
+        label="SL"
+    )
+
+    plt.title(f"{pair} 5M SIGNAL ZONE")
+
+    plt.legend()
+
+    filename = f"{pair}_chart.png"
+
+    plt.savefig(filename)
+
     plt.close()
-    return file
 
-# =========================
-# BEST PAIR SCANNER (/signal FIX)
-# =========================
-@client.tree.command(name="signal")
+    return filename
+
+# ==================================================
+# SIGNAL COMMAND
+# ==================================================
+@client.tree.command(
+    name="signal",
+    description="Best AI trading signal"
+)
 async def signal(interaction: discord.Interaction):
 
     await interaction.response.defer()
 
-    best = None
+    best_signal = None
     best_score = -999
-    best_df = None
 
-    for p in PAIRS:
-        d = generate(p)
+    for pair in PAIRS.keys():
 
-        if d["score"] > best_score:
-            best = d
-            best_score = d["score"]
-            best_df = get_data(PAIRS[p])
+        try:
+            signal_data = generate_signal(pair)
 
-    file = chart(best_df, best["pair"], best["entry"], best["tp"], best["sl"])
+            if signal_data["score"] > best_score:
 
-    await interaction.followup.send(
-        fmt(best),
-        file=discord.File(file)
+                best_score = signal_data["score"]
+                best_signal = signal_data
+
+        except Exception as e:
+            print(f"ERROR {pair}: {e}")
+
+    if best_signal is None:
+
+        await interaction.followup.send(
+            "❌ Tidak ada signal tersedia."
+        )
+        return
+
+    chart_file = create_chart(
+        best_signal["df"],
+        best_signal["pair"],
+        best_signal["entry"],
+        best_signal["tp"],
+        best_signal["sl"]
     )
 
-# =========================
-# SHOW CHART ONLY
-# =========================
-@client.tree.command(name="show_trend_chart")
-async def chart_cmd(interaction: discord.Interaction, pair: str):
-    df = get_data(PAIRS[pair])
-    file = chart(df, pair, 0, 0, 0)
-    await interaction.response.send_message(file=discord.File(file))
+    await interaction.followup.send(
+        format_signal(best_signal),
+        file=discord.File(chart_file)
+    )
 
-# =========================
+# ==================================================
+# SHOW TREND CHART
+# ==================================================
+@client.tree.command(
+    name="show_trend_chart",
+    description="Show pair chart"
+)
+async def show_chart(
+    interaction: discord.Interaction,
+    pair: str
+):
+
+    pair = pair.upper()
+
+    if pair not in PAIRS:
+
+        await interaction.response.send_message(
+            f"""
+❌ Pair tidak tersedia.
+
+Available:
+{', '.join(PAIRS.keys())}
+"""
+        )
+        return
+
+    await interaction.response.defer()
+
+    signal_data = generate_signal(pair)
+
+    chart_file = create_chart(
+        signal_data["df"],
+        pair,
+        signal_data["entry"],
+        signal_data["tp"],
+        signal_data["sl"]
+    )
+
+    await interaction.followup.send(
+        f"📊 {pair} Trend Chart",
+        file=discord.File(chart_file)
+    )
+
+# ==================================================
 # AUTO TOGGLE
-# =========================
-@client.tree.command(name="auto_toggle")
-async def toggle(interaction: discord.Interaction):
+# ==================================================
+@client.tree.command(
+    name="auto_toggle",
+    description="Toggle auto signal"
+)
+async def auto_toggle(interaction: discord.Interaction):
+
     global AUTO_SIGNAL
+
     AUTO_SIGNAL = not AUTO_SIGNAL
-    await interaction.response.send_message(f"AUTO: {AUTO_SIGNAL}")
 
-# =========================
-# AUTO LOOP
-# =========================
-async def loop():
+    await interaction.response.send_message(
+        f"AUTO SIGNAL: {AUTO_SIGNAL}"
+    )
+
+# ==================================================
+# AUTO SIGNAL LOOP
+# ==================================================
+async def auto_signal_loop():
+
     await client.wait_until_ready()
-    ch = client.get_channel(CHANNEL_ID)
 
-    while True:
-        if AUTO_SIGNAL:
-            for p in PAIRS:
-                d = generate(p)
-                if d["score"] >= 75:
-                    df = get_data(PAIRS[p])
-                    file = chart(df, p, d["entry"], d["tp"], d["sl"])
-                    await ch.send(fmt(d), file=discord.File(file))
+    channel = client.get_channel(CHANNEL_ID)
 
-        await asyncio.sleep(900)
+    while not client.is_closed():
 
-# =========================
+        try:
+
+            if AUTO_SIGNAL:
+
+                for pair in PAIRS.keys():
+
+                    try:
+
+                        signal_data = generate_signal(pair)
+
+                        if signal_data["score"] >= 75:
+
+                            chart_file = create_chart(
+                                signal_data["df"],
+                                pair,
+                                signal_data["entry"],
+                                signal_data["tp"],
+                                signal_data["sl"]
+                            )
+
+                            await channel.send(
+                                format_signal(signal_data),
+                                file=discord.File(chart_file)
+                            )
+
+                    except Exception as e:
+                        print(f"AUTO ERROR {pair}: {e}")
+
+            await asyncio.sleep(900)
+
+        except Exception as e:
+            print(f"LOOP ERROR: {e}")
+            await asyncio.sleep(30)
+
+# ==================================================
 # READY
-# =========================
+# ==================================================
 @client.event
 async def on_ready():
+
     await client.tree.sync()
-    print("V4 AI TRADING BOT READY")
 
-asyncio.get_event_loop().create_task(loop())
+    print("V5 AI TRADING BOT READY")
 
-client.run(TOKEN)
+# ==================================================
+# START
+# ==================================================
+async def main():
+
+    async with client:
+
+        client.loop.create_task(
+            auto_signal_loop()
+        )
+
+        await client.start(TOKEN)
+
+asyncio.run(main())
