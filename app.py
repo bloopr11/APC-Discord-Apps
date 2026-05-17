@@ -9,7 +9,7 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
+import mplfinance as mpf
 
 # ==================================================
 # ENV
@@ -40,6 +40,7 @@ class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(intents=intents)
+
         self.tree = app_commands.CommandTree(self)
 
 client = Bot()
@@ -52,14 +53,14 @@ def get_data(symbol):
     df = yf.download(
         symbol,
         period="5d",
-        interval="15m",
+        interval="5m",
         auto_adjust=True,
         progress=False
     )
 
     df = df.dropna()
 
-    # FIX multi index
+    # FIX multi-index columns
     df.columns = [
         col[0] if isinstance(col, tuple) else col
         for col in df.columns
@@ -68,11 +69,14 @@ def get_data(symbol):
     return df
 
 # ==================================================
-# INDICATORS
+# EMA
 # ==================================================
 def ema(series, period):
     return series.ewm(span=period).mean()
 
+# ==================================================
+# RSI
+# ==================================================
 def rsi(series, period=14):
 
     delta = series.diff()
@@ -87,15 +91,18 @@ def rsi(series, period=14):
 
     return 100 - (100 / (1 + rs))
 
+# ==================================================
+# MACD
+# ==================================================
 def macd(series):
 
     ema12 = ema(series, 12)
     ema26 = ema(series, 26)
 
     macd_line = ema12 - ema26
-    signal = ema(macd_line, 9)
+    signal_line = ema(macd_line, 9)
 
-    return macd_line, signal
+    return macd_line, signal_line
 
 # ==================================================
 # SMC ENGINE
@@ -112,7 +119,7 @@ def smc(df):
         < df["Low"].rolling(10).min().iloc[-2]
     )
 
-    liq = (
+    liquidity_sweep = (
         df["High"].iloc[-1]
         > df["High"].rolling(20).max().iloc[-2]
     )
@@ -120,22 +127,23 @@ def smc(df):
     return {
         "BOS": bos,
         "CHoCH": choch,
-        "LIQ": liq
+        "LIQ": liquidity_sweep
     }
 
 # ==================================================
-# LIQUIDITY
+# LIQUIDITY ENGINE
 # ==================================================
 def liquidity(df):
 
     high_zone = df["High"].rolling(20).max().iloc[-1]
     low_zone = df["Low"].rolling(20).min().iloc[-1]
 
-    price = df["Close"].iloc[-1]
+    current_price = df["Close"].iloc[-1]
 
     pressure = (
         "BUY"
-        if abs(price - low_zone) < abs(price - high_zone)
+        if abs(current_price - low_zone)
+        < abs(current_price - high_zone)
         else "SELL"
     )
 
@@ -146,7 +154,7 @@ def liquidity(df):
     }
 
 # ==================================================
-# FLOW
+# FLOW ENGINE
 # ==================================================
 def flow(df):
 
@@ -162,10 +170,14 @@ def flow(df):
 # ==================================================
 def lstm_prediction(df):
 
-    current = df["Close"].iloc[-1]
+    current_price = df["Close"].iloc[-1]
     mean_price = df["Close"].mean()
 
-    return "BULLISH" if current > mean_price else "BEARISH"
+    return (
+        "BULLISH"
+        if current_price > mean_price
+        else "BEARISH"
+    )
 
 # ==================================================
 # AI SCORE
@@ -223,7 +235,7 @@ def generate_signal(pair):
         - macd_signal.iloc[-1]
     )
 
-    # AI engines
+    # AI
     smc_data = smc(df)
     liq = liquidity(df)
     fl = flow(df)
@@ -236,21 +248,23 @@ def generate_signal(pair):
         fl
     )
 
-    action = "BUY" if score >= 55 else "SELL"
+    action = (
+        "BUY"
+        if score >= 55
+        else "SELL"
+    )
 
     price = float(close.iloc[-1])
 
-    tp = (
-        price + (price * 0.01)
-        if action == "BUY"
-        else price - (price * 0.01)
-    )
+    if action == "BUY":
 
-    sl = (
-        price - (price * 0.01)
-        if action == "BUY"
-        else price + (price * 0.01)
-    )
+        tp = price + (price * 0.01)
+        sl = price - (price * 0.01)
+
+    else:
+
+        tp = price - (price * 0.01)
+        sl = price + (price * 0.01)
 
     return {
         "pair": pair,
@@ -269,7 +283,7 @@ def generate_signal(pair):
     }
 
 # ==================================================
-# FORMAT MESSAGE
+# FORMAT SIGNAL
 # ==================================================
 def format_signal(data):
 
@@ -299,50 +313,64 @@ def format_signal(data):
 """
 
 # ==================================================
-# CREATE CHART
+# CREATE CANDLE CHART
 # ==================================================
 def create_chart(df, pair, entry, tp, sl):
 
-    plt.figure(figsize=(12, 5))
+    df_chart = df.copy()
 
-    plt.plot(df["Close"], linewidth=2)
+    df_chart.index.name = "Date"
 
-    plt.axhline(
-        entry,
-        linestyle="--",
-        label="ENTRY"
+    # EMA
+    df_chart["EMA20"] = ema(df_chart["Close"], 20)
+    df_chart["EMA50"] = ema(df_chart["Close"], 50)
+
+    addplots = [
+
+        mpf.make_addplot(
+            df_chart["EMA20"]
+        ),
+
+        mpf.make_addplot(
+            df_chart["EMA50"]
+        ),
+
+        mpf.make_addplot(
+            [entry] * len(df_chart),
+            linestyle="--"
+        ),
+
+        mpf.make_addplot(
+            [tp] * len(df_chart),
+            linestyle="--"
+        ),
+
+        mpf.make_addplot(
+            [sl] * len(df_chart),
+            linestyle="--"
+        )
+    ]
+
+    filename = f"{pair}_candles.png"
+
+    mpf.plot(
+        df_chart,
+        type="candle",
+        style="charles",
+        volume=False,
+        title=f"{pair} 5M SIGNAL",
+        addplot=addplots,
+        savefig=filename
     )
-
-    plt.axhline(
-        tp,
-        linestyle="--",
-        label="TP"
-    )
-
-    plt.axhline(
-        sl,
-        linestyle="--",
-        label="SL"
-    )
-
-    plt.title(f"{pair} 5M SIGNAL ZONE")
-
-    plt.legend()
-
-    filename = f"{pair}_chart.png"
-
-    plt.savefig(filename)
-
-    plt.close()
 
     return filename
 
 # ==================================================
-# SIGNAL COMMAND
+# /SIGNAL
 # ==================================================
 @client.tree.command(
     name="signal",
-    description="Best AI trading signal"
+    description="Best AI signal scanner"
 )
 async def signal(interaction: discord.Interaction):
 
@@ -354,6 +382,7 @@ async def signal(interaction: discord.Interaction):
     for pair in PAIRS.keys():
 
         try:
+
             signal_data = generate_signal(pair)
 
             if signal_data["score"] > best_score:
@@ -362,6 +391,7 @@ async def signal(interaction: discord.Interaction):
                 best_signal = signal_data
 
         except Exception as e:
+
             print(f"ERROR {pair}: {e}")
 
     if best_signal is None:
@@ -385,11 +415,11 @@ async def signal(interaction: discord.Interaction):
     )
 
 # ==================================================
-# SHOW TREND CHART
+# /SHOW_TREND_CHART
 # ==================================================
 @client.tree.command(
     name="show_trend_chart",
-    description="Show pair chart"
+    description="Show trend chart pair"
 )
 async def show_chart(
     interaction: discord.Interaction,
@@ -423,12 +453,12 @@ Available:
     )
 
     await interaction.followup.send(
-        f"📊 {pair} Trend Chart",
+        f"📊 {pair} 5M Candle Chart",
         file=discord.File(chart_file)
     )
 
 # ==================================================
-# AUTO TOGGLE
+# /AUTO_TOGGLE
 # ==================================================
 @client.tree.command(
     name="auto_toggle",
@@ -481,12 +511,15 @@ async def auto_signal_loop():
                             )
 
                     except Exception as e:
+
                         print(f"AUTO ERROR {pair}: {e}")
 
             await asyncio.sleep(900)
 
         except Exception as e:
+
             print(f"LOOP ERROR: {e}")
+
             await asyncio.sleep(30)
 
 # ==================================================
@@ -497,7 +530,7 @@ async def on_ready():
 
     await client.tree.sync()
 
-    print("V5 AI TRADING BOT READY")
+    print("V6 INSTITUTIONAL AI BOT READY")
 
 # ==================================================
 # START
