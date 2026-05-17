@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # =========================
-# ENV CONFIG
+# ENV
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
@@ -24,7 +24,7 @@ PAIRS = {
     "XAUUSD": "GC=F"
 }
 
-TIMEFRAME = "15m"
+TIMEFRAME = "5m"
 AUTO_SIGNAL = False
 
 # =========================
@@ -38,7 +38,7 @@ class Bot(discord.Client):
 client = Bot()
 
 # =========================
-# MARKET DATA (TRADINGVIEW STYLE)
+# DATA
 # =========================
 def get_data(symbol):
     df = yf.download(symbol, period="5d", interval="15m")
@@ -46,7 +46,7 @@ def get_data(symbol):
     return df
 
 # =========================
-# INDICATORS (EMA RSI MACD)
+# INDICATORS
 # =========================
 def ema(s, p):
     return s.ewm(span=p).mean()
@@ -66,178 +66,189 @@ def macd(s):
     return macd, sig
 
 # =========================
-# SMC ENGINE (REAL STRUCTURE)
+# SMC
 # =========================
 def smc(df):
     last = df.iloc[-1]
 
     bos = last["Close"] > df["High"].rolling(10).max().iloc[-2]
     choch = last["Close"] < df["Low"].rolling(10).min().iloc[-2]
-    liquidity = last["High"] > df["High"].rolling(20).max().iloc[-2]
+    liq = last["High"] > df["High"].rolling(20).max().iloc[-2]
 
-    return {
-        "BOS": bool(bos),
-        "CHoCH": bool(choch),
-        "LIQ": bool(liquidity)
-    }
+    return {"BOS": bool(bos), "CHoCH": bool(choch), "LIQ": bool(liq)}
 
 # =========================
-# ORDER BLOCK DETECTION
-# =========================
-def order_block(df):
-    last = df.iloc[-1]
-
-    bullish_ob = last["Close"] > df["High"].rolling(5).max().iloc[-2]
-    bearish_ob = last["Close"] < df["Low"].rolling(5).min().iloc[-2]
-
-    return {
-        "BULLISH_OB": bool(bullish_ob),
-        "BEARISH_OB": bool(bearish_ob)
-    }
-
-# =========================
-# LIQUIDITY HEATMAP
+# LIQUIDITY
 # =========================
 def liquidity(df):
-    high_zone = df["High"].rolling(20).max().iloc[-1]
-    low_zone = df["Low"].rolling(20).min().iloc[-1]
-
+    high = df["High"].rolling(20).max().iloc[-1]
+    low = df["Low"].rolling(20).min().iloc[-1]
     price = df["Close"].iloc[-1]
 
     return {
-        "HIGH_ZONE": high_zone,
-        "LOW_ZONE": low_zone,
-        "PRESSURE": "BUY" if abs(price-low_zone) < abs(price-high_zone) else "SELL"
+        "HIGH": high,
+        "LOW": low,
+        "PRESSURE": "BUY" if abs(price-low) < abs(price-high) else "SELL"
     }
 
 # =========================
-# INSTITUTIONAL FLOW
+# FLOW
 # =========================
 def flow(df):
     momentum = df["Close"].diff().mean()
-
     return {
         "FLOW": "BUY" if momentum > 0 else "SELL",
-        "STRENGTH": abs(momentum)*100
+        "STRENGTH": abs(momentum) * 100
     }
 
 # =========================
-# LSTM SIMPLIFIED PREDICTION (NO TRAIN MODEL - SAFE VERSION)
+# LSTM (SIMPLIFIED)
 # =========================
-def lstm_signal(df):
-    close = df["Close"]
-    future = close.mean() + (close.diff().mean() * 3)
-
-    return "BULLISH" if future > close.iloc[-1] else "BEARISH"
+def lstm(df):
+    return "BULLISH" if df["Close"].iloc[-1] > df["Close"].mean() else "BEARISH"
 
 # =========================
-# AI SCORE ENGINE
+# AI SCORE
 # =========================
-def ai_score(lstm, smc, liq, flow):
-    score = 50
+def score(l, s, liq, fl):
+    sc = 50
 
-    if lstm == "BULLISH":
-        score += 20
-    else:
-        score -= 20
+    if l == "BULLISH": sc += 20
+    else: sc -= 20
 
-    if smc["BOS"]:
-        score += 10
-    if smc["LIQ"]:
-        score += 10
-    if smc["CHoCH"]:
-        score -= 10
+    if s["BOS"]: sc += 10
+    if s["LIQ"]: sc += 10
+    if s["CHoCH"]: sc -= 10
 
-    if liq["PRESSURE"] == "BUY":
-        score += 10
-    else:
-        score -= 10
+    if liq["PRESSURE"] == "BUY": sc += 10
+    else: sc -= 10
 
-    if flow["FLOW"] == "BUY":
-        score += 10
-    else:
-        score -= 10
+    if fl["FLOW"] == "BUY": sc += 10
+    else: sc -= 10
 
-    return max(0, min(100, score))
+    return max(0, min(100, sc))
 
 # =========================
-# SIGNAL ENGINE
+# GENERATE SIGNAL
 # =========================
 def generate(pair):
     df = get_data(PAIRS[pair])
     close = df["Close"]
 
     r = rsi(close).iloc[-1]
-    macd_line, macd_sig = macd(close)
-    m = macd_line.iloc[-1] - macd_sig.iloc[-1]
+    m1, m2 = macd(close)
+    m = m1.iloc[-1] - m2.iloc[-1]
 
     s = smc(df)
-    ob = order_block(df)
     liq = liquidity(df)
     fl = flow(df)
-    lstm = lstm_signal(df)
+    l = lstm(df)
 
-    score = ai_score(lstm, s, liq, fl)
-
-    action = "BUY" if score >= 55 else "SELL"
+    sc = score(l, s, liq, fl)
 
     price = float(close.iloc[-1])
 
     return {
         "pair": pair,
-        "score": score,
-        "lstm": lstm,
-        "rsi": round(r,2),
-        "macd": round(m,2),
+        "score": sc,
+        "lstm": l,
+        "rsi": r,
+        "macd": m,
         "smc": s,
-        "ob": ob,
         "liq": liq,
         "flow": fl,
-        "action": action,
         "entry": price,
-        "tp": price + 100,
-        "sl": price - 100
+        "tp": price + (price * 0.01),
+        "sl": price - (price * 0.01)
     }
 
 # =========================
-# FORMAT MESSAGE
+# FORMAT
 # =========================
 def fmt(d):
     return f"""
-📊 {d['pair']} INSTITUTIONAL AI SIGNAL
+📊 {d['pair']} AI INSTITUTIONAL SIGNAL
 
-🧠 AI SCORE: {d['score']}%
+🧠 SCORE: {d['score']}%
 
 📈 LSTM: {d['lstm']}
-📊 RSI: {d['rsi']}
-📊 MACD: {d['macd']}
+📊 RSI: {d['rsi']:.2f}
+📊 MACD: {d['macd']:.2f}
 
 🏗 BOS: {d['smc']['BOS']}
 🔄 CHoCH: {d['smc']['CHoCH']}
 💧 LIQ: {d['smc']['LIQ']}
 
-📦 Order Block: {d['ob']}
-💧 Liquidity Pressure: {d['liq']['PRESSURE']}
+💧 Pressure: {d['liq']['PRESSURE']}
 🏦 Flow: {d['flow']['FLOW']} ({d['flow']['STRENGTH']:.2f})
 
-🟢 ACTION: {d['action']}
-Entry: {d['entry']}
-TP: {d['tp']}
-SL: {d['sl']}
+🟢 ENTRY: {d['entry']}
+🎯 TP: {d['tp']}
+🛑 SL: {d['sl']}
 """
 
 # =========================
-# CHART
+# CHART 5M ZONE
 # =========================
-def chart(df, pair):
+def chart(df, pair, entry, tp, sl):
     plt.figure(figsize=(10,4))
-    plt.plot(df["Close"])
-    plt.title(pair)
+    plt.plot(df["Close"], label="Price")
 
-    file = f"{pair}.png"
+    plt.axhline(entry, linestyle="--", color="blue")
+    plt.axhline(tp, linestyle="--", color="green")
+    plt.axhline(sl, linestyle="--", color="red")
+
+    plt.title(f"{pair} 5M ENTRY ZONE")
+
+    file = f"{pair}_signal.png"
     plt.savefig(file)
     plt.close()
     return file
+
+# =========================
+# BEST PAIR SCANNER (/signal FIX)
+# =========================
+@client.tree.command(name="signal")
+async def signal(interaction: discord.Interaction):
+
+    await interaction.response.defer()
+
+    best = None
+    best_score = -999
+    best_df = None
+
+    for p in PAIRS:
+        d = generate(p)
+
+        if d["score"] > best_score:
+            best = d
+            best_score = d["score"]
+            best_df = get_data(PAIRS[p])
+
+    file = chart(best_df, best["pair"], best["entry"], best["tp"], best["sl"])
+
+    await interaction.followup.send(
+        fmt(best),
+        file=discord.File(file)
+    )
+
+# =========================
+# SHOW CHART ONLY
+# =========================
+@client.tree.command(name="show_trend_chart")
+async def chart_cmd(interaction: discord.Interaction, pair: str):
+    df = get_data(PAIRS[pair])
+    file = chart(df, pair, 0, 0, 0)
+    await interaction.response.send_message(file=discord.File(file))
+
+# =========================
+# AUTO TOGGLE
+# =========================
+@client.tree.command(name="auto_toggle")
+async def toggle(interaction: discord.Interaction):
+    global AUTO_SIGNAL
+    AUTO_SIGNAL = not AUTO_SIGNAL
+    await interaction.response.send_message(f"AUTO: {AUTO_SIGNAL}")
 
 # =========================
 # AUTO LOOP
@@ -250,41 +261,20 @@ async def loop():
         if AUTO_SIGNAL:
             for p in PAIRS:
                 d = generate(p)
-
                 if d["score"] >= 75:
-                    await ch.send(fmt(d))
+                    df = get_data(PAIRS[p])
+                    file = chart(df, p, d["entry"], d["tp"], d["sl"])
+                    await ch.send(fmt(d), file=discord.File(file))
 
         await asyncio.sleep(900)
 
 # =========================
-# SLASH COMMANDS
-# =========================
-@client.tree.command(name="signal")
-async def signal(interaction: discord.Interaction):
-    d = generate("BTCUSD")
-    await interaction.response.send_message(fmt(d))
-
-
-@client.tree.command(name="show_trend_chart")
-async def show(interaction: discord.Interaction, pair: str):
-    df = get_data(PAIRS[pair])
-    file = chart(df, pair)
-    await interaction.response.send_message(file=discord.File(file))
-
-
-@client.tree.command(name="auto_toggle")
-async def toggle(interaction: discord.Interaction):
-    global AUTO_SIGNAL
-    AUTO_SIGNAL = not AUTO_SIGNAL
-    await interaction.response.send_message(f"AUTO SIGNAL: {AUTO_SIGNAL}")
-
-# =========================
-# START
+# READY
 # =========================
 @client.event
 async def on_ready():
     await client.tree.sync()
-    print("INSTITUTIONAL AI BOT READY")
+    print("V4 AI TRADING BOT READY")
 
 asyncio.get_event_loop().create_task(loop())
 
