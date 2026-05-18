@@ -1,5 +1,6 @@
 import discord
 from discord import app_commands
+from discord.ui import View, Button, Select
 import asyncio
 import os
 import pandas as pd
@@ -14,24 +15,35 @@ import mplfinance as mpf
 # ==================================================
 # ENV
 # ==================================================
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN      = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
 # ==================================================
 # PAIRS
 # ==================================================
 PAIRS = {
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
-    "XAUUSD": "GC=F",
-    "XRPUSD": "XRP-USD",
-    "SOLUSD": "SOL-USD",
-    "ADAUSD": "ADA-USD",
-    "DOGEUSD": "DOGE-USD"
+    "BTCUSD":  "BTC-USD",
+    "ETHUSD":  "ETH-USD",
+    "XAUUSD":  "GC=F",
+    "XRPUSD":  "XRP-USD",
+    "SOLUSD":  "SOL-USD",
+    "ADAUSD":  "ADA-USD",
+    "DOGEUSD": "DOGE-USD",
+    "BNBUSD":  "BNB-USD",
+    "AVAXUSD": "AVAX-USD",
+    "LINKUSD": "LINK-USD",
 }
 
-TIMEFRAME = "5m"
+TIMEFRAMES = {
+    "5m":  {"period": "5d",  "interval": "5m"},
+    "15m": {"period": "7d",  "interval": "15m"},
+    "1h":  {"period": "30d", "interval": "1h"},
+    "4h":  {"period": "60d", "interval": "4h"},
+}
+
+DEFAULT_TF  = "5m"
 AUTO_SIGNAL = False
+AUTO_MIN_SCORE = 75          # kirim auto-signal jika score >= nilai ini
 
 # ==================================================
 # DISCORD CLIENT
@@ -40,486 +52,699 @@ class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(intents=intents)
-
         self.tree = app_commands.CommandTree(self)
 
 client = Bot()
 
 # ==================================================
-# GET MARKET DATA
+# MARKET DATA
 # ==================================================
-def get_data(symbol):
-
-    df = yf.download(
+def get_data(symbol: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
+    cfg = TIMEFRAMES.get(timeframe, TIMEFRAMES[DEFAULT_TF])
+    df  = yf.download(
         symbol,
-        period="5d",
-        interval="5m",
-        auto_adjust=True,
-        progress=False
+        period   = cfg["period"],
+        interval = cfg["interval"],
+        auto_adjust = True,
+        progress    = False,
     )
-
     df = df.dropna()
-
-    # FIX multi-index columns
-    df.columns = [
-        col[0] if isinstance(col, tuple) else col
-        for col in df.columns
-    ]
-
+    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
     return df
 
 # ==================================================
-# EMA
+# INDICATORS
 # ==================================================
-def ema(series, period):
-    return series.ewm(span=period).mean()
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-# ==================================================
-# RSI
-# ==================================================
-def rsi(series, period=14):
-
-    delta = series.diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / avg_loss
-
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-# ==================================================
-# MACD
-# ==================================================
-def macd(series):
-
-    ema12 = ema(series, 12)
-    ema26 = ema(series, 26)
-
-    macd_line = ema12 - ema26
+def macd(series: pd.Series):
+    ema12       = ema(series, 12)
+    ema26       = ema(series, 26)
+    macd_line   = ema12 - ema26
     signal_line = ema(macd_line, 9)
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
 
-    return macd_line, signal_line
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+def stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
+    low_min  = df["Low"].rolling(k_period).min()
+    high_max = df["High"].rolling(k_period).max()
+    stoch_k  = 100 * (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+    stoch_d  = stoch_k.rolling(d_period).mean()
+    return stoch_k, stoch_d
+
+def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0):
+    sma    = series.rolling(period).mean()
+    std    = series.rolling(period).std()
+    upper  = sma + std_dev * std
+    lower  = sma - std_dev * std
+    return upper, sma, lower
+
+def volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
+    """Current volume vs rolling average — >1 means above-average activity."""
+    if "Volume" not in df.columns or df["Volume"].sum() == 0:
+        return 1.0
+    avg_vol = df["Volume"].rolling(period).mean().iloc[-1]
+    cur_vol = df["Volume"].iloc[-1]
+    return float(cur_vol / avg_vol) if avg_vol else 1.0
 
 # ==================================================
-# SMC ENGINE
+# RSI DIVERGENCE
 # ==================================================
-def smc(df):
+def rsi_divergence(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) -> str:
+    """
+    Bullish divergence  : price lower low, RSI higher low  → potential reversal up
+    Bearish divergence  : price higher high, RSI lower high → potential reversal down
+    """
+    close = df["Close"]
+    price_diff = close.iloc[-1] - close.iloc[-lookback]
+    rsi_diff   = rsi_series.iloc[-1] - rsi_series.iloc[-lookback]
 
-    bos = (
-        df["Close"].iloc[-1]
-        > df["High"].rolling(10).max().iloc[-2]
-    )
+    if price_diff < 0 and rsi_diff > 0:
+        return "BULLISH_DIV"
+    if price_diff > 0 and rsi_diff < 0:
+        return "BEARISH_DIV"
+    return "NONE"
 
-    choch = (
-        df["Close"].iloc[-1]
-        < df["Low"].rolling(10).min().iloc[-2]
-    )
+# ==================================================
+# EMA CONFLUENCE
+# ==================================================
+def ema_confluence(df: pd.DataFrame):
+    close = df["Close"]
+    e8    = ema(close, 8).iloc[-1]
+    e21   = ema(close, 21).iloc[-1]
+    e50   = ema(close, 50).iloc[-1]
+    e200  = ema(close, 200).iloc[-1]
+    price = close.iloc[-1]
 
-    liquidity_sweep = (
-        df["High"].iloc[-1]
-        > df["High"].rolling(20).max().iloc[-2]
-    )
+    bullish = price > e8 > e21 > e50    # stacked bull
+    bearish = price < e8 < e21 < e50    # stacked bear
+    near_200 = abs(price - e200) / e200 < 0.005   # within 0.5% of 200 EMA
 
     return {
-        "BOS": bos,
-        "CHoCH": choch,
-        "LIQ": liquidity_sweep
+        "BULLISH_STACK": bullish,
+        "BEARISH_STACK": bearish,
+        "NEAR_200EMA":   near_200,
+        "E8": e8, "E21": e21, "E50": e50, "E200": e200,
+    }
+
+# ==================================================
+# SMC ENGINE (improved)
+# ==================================================
+def smc(df: pd.DataFrame) -> dict:
+    close, high, low = df["Close"], df["High"], df["Low"]
+
+    swing_high  = high.rolling(10).max()
+    swing_low   = low.rolling(10).min()
+
+    bos    = close.iloc[-1] > swing_high.iloc[-2]
+    choch  = close.iloc[-1] < swing_low.iloc[-2]
+    liq    = high.iloc[-1]  > high.rolling(20).max().iloc[-2]
+
+    # Order block: last big bearish/bullish candle before a BOS
+    body       = (close - df["Open"]).abs()
+    big_candle = body.iloc[-3] > body.rolling(10).mean().iloc[-3]
+
+    return {
+        "BOS":        bool(bos),
+        "CHoCH":      bool(choch),
+        "LIQ":        bool(liq),
+        "ORDER_BLOCK": bool(big_candle),
     }
 
 # ==================================================
 # LIQUIDITY ENGINE
 # ==================================================
-def liquidity(df):
-
-    high_zone = df["High"].rolling(20).max().iloc[-1]
-    low_zone = df["Low"].rolling(20).min().iloc[-1]
-
+def liquidity(df: pd.DataFrame) -> dict:
+    high_zone     = df["High"].rolling(20).max().iloc[-1]
+    low_zone      = df["Low"].rolling(20).min().iloc[-1]
     current_price = df["Close"].iloc[-1]
-
-    pressure = (
-        "BUY"
-        if abs(current_price - low_zone)
-        < abs(current_price - high_zone)
+    pressure      = (
+        "BUY" if abs(current_price - low_zone) < abs(current_price - high_zone)
         else "SELL"
     )
-
-    return {
-        "HIGH_ZONE": high_zone,
-        "LOW_ZONE": low_zone,
-        "PRESSURE": pressure
-    }
+    return {"HIGH_ZONE": high_zone, "LOW_ZONE": low_zone, "PRESSURE": pressure}
 
 # ==================================================
 # FLOW ENGINE
 # ==================================================
-def flow(df):
-
+def flow(df: pd.DataFrame) -> dict:
     momentum = df["Close"].diff().mean()
-
     return {
-        "FLOW": "BUY" if momentum > 0 else "SELL",
-        "STRENGTH": abs(momentum) * 100
+        "FLOW":     "BUY" if momentum > 0 else "SELL",
+        "STRENGTH": abs(momentum) * 100,
     }
 
 # ==================================================
-# LSTM PROXY
+# LSTM PROXY (improved: multi-EMA weighted bias)
 # ==================================================
-def lstm_prediction(df):
-
-    current_price = df["Close"].iloc[-1]
-    mean_price = df["Close"].mean()
-
-    return (
-        "BULLISH"
-        if current_price > mean_price
-        else "BEARISH"
-    )
+def lstm_prediction(df: pd.DataFrame) -> str:
+    close   = df["Close"]
+    price   = close.iloc[-1]
+    ema20   = ema(close, 20).iloc[-1]
+    ema50   = ema(close, 50).iloc[-1]
+    ema200  = ema(close, 200).iloc[-1]
+    score   = sum([price > ema20, price > ema50, price > ema200])
+    return "BULLISH" if score >= 2 else "BEARISH"
 
 # ==================================================
-# AI SCORE
+# IMPROVED AI SCORE  (max 100)
 # ==================================================
-def ai_score(lstm, smc_data, liq, fl):
-
+def ai_score(lstm, smc_data, liq, fl, rsi_val, macd_hist, ema_conf,
+             rsi_div, vol_ratio, stoch_k_val, bb_pos) -> int:
     score = 50
 
-    # LSTM
-    if lstm == "BULLISH":
-        score += 20
-    else:
-        score -= 20
+    # ── LSTM (multi-EMA) ──────────────────────────
+    score += 15 if lstm == "BULLISH" else -15
 
-    # SMC
-    if smc_data["BOS"]:
-        score += 10
+    # ── SMC ──────────────────────────────────────
+    if smc_data["BOS"]:         score += 8
+    if smc_data["LIQ"]:         score += 6
+    if smc_data["ORDER_BLOCK"]: score += 5
+    if smc_data["CHoCH"]:       score -= 10
 
-    if smc_data["LIQ"]:
-        score += 10
+    # ── Liquidity pressure ────────────────────────
+    score += 8 if liq["PRESSURE"] == "BUY" else -8
 
-    if smc_data["CHoCH"]:
-        score -= 10
+    # ── Flow ─────────────────────────────────────
+    score += 5 if fl["FLOW"] == "BUY" else -5
 
-    # Liquidity
-    if liq["PRESSURE"] == "BUY":
-        score += 10
-    else:
-        score -= 10
+    # ── RSI ──────────────────────────────────────
+    if rsi_val < 30:   score += 10   # oversold → bullish edge
+    elif rsi_val > 70: score -= 10   # overbought → bearish edge
+    elif 45 <= rsi_val <= 55:
+        score += 0                   # neutral zone
+    elif rsi_val > 55: score += 4
+    else:              score -= 4
 
-    # Flow
-    if fl["FLOW"] == "BUY":
-        score += 10
-    else:
-        score -= 10
+    # ── RSI Divergence ────────────────────────────
+    if rsi_div == "BULLISH_DIV":  score += 8
+    elif rsi_div == "BEARISH_DIV": score -= 8
+
+    # ── MACD Histogram ────────────────────────────
+    if macd_hist > 0:  score += 6
+    else:              score -= 6
+
+    # ── EMA Confluence ───────────────────────────
+    if ema_conf["BULLISH_STACK"]:  score += 10
+    if ema_conf["BEARISH_STACK"]:  score -= 10
+    if ema_conf["NEAR_200EMA"]:    score += 3   # 200 EMA magnet
+
+    # ── Volume ───────────────────────────────────
+    if vol_ratio >= 1.5:   score += 5   # high volume confirms move
+    elif vol_ratio < 0.7:  score -= 3   # weak volume → less reliable
+
+    # ── Stochastic ───────────────────────────────
+    if stoch_k_val < 20:   score += 5
+    elif stoch_k_val > 80: score -= 5
+
+    # ── Bollinger Band position ───────────────────
+    # bb_pos: 0 = at lower, 1 = at upper
+    if bb_pos < 0.15:      score += 4   # near lower band
+    elif bb_pos > 0.85:    score -= 4   # near upper band
 
     return max(0, min(100, score))
 
 # ==================================================
+# CONFIDENCE LABEL
+# ==================================================
+def confidence_label(score: int) -> str:
+    if score >= 80: return "🔥 VERY HIGH"
+    if score >= 65: return "✅ HIGH"
+    if score >= 50: return "⚠️ MODERATE"
+    return "❌ LOW"
+
+# ==================================================
+# ATR-BASED TP/SL
+# ==================================================
+def tp_sl_from_atr(df: pd.DataFrame, action: str, atr_val: float):
+    price = float(df["Close"].iloc[-1])
+    mult_tp = 2.0   # 2× ATR TP
+    mult_sl = 1.0   # 1× ATR SL  → RR 1:2
+    if action == "BUY":
+        return price + mult_tp * atr_val, price - mult_sl * atr_val
+    else:
+        return price - mult_tp * atr_val, price + mult_sl * atr_val
+
+# ==================================================
 # GENERATE SIGNAL
 # ==================================================
-def generate_signal(pair):
-
-    df = get_data(PAIRS[pair])
-
+def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
+    df    = get_data(PAIRS[pair], timeframe)
     close = df["Close"]
 
     # indicators
-    rsi_value = rsi(close).iloc[-1]
-
-    macd_line, macd_signal = macd(close)
-
-    macd_value = (
-        macd_line.iloc[-1]
-        - macd_signal.iloc[-1]
+    rsi_series          = rsi(close)
+    rsi_val             = float(rsi_series.iloc[-1])
+    macd_line, macd_sig, macd_hist = macd(close)
+    macd_hist_val       = float(macd_hist.iloc[-1])
+    atr_val             = float(atr(df).iloc[-1])
+    stoch_k, stoch_d    = stochastic(df)
+    stoch_k_val         = float(stoch_k.iloc[-1])
+    bb_upper, bb_mid, bb_lower = bollinger_bands(close)
+    bb_range            = float(bb_upper.iloc[-1] - bb_lower.iloc[-1])
+    bb_pos              = float(
+        (close.iloc[-1] - bb_lower.iloc[-1]) / bb_range
+        if bb_range else 0.5
     )
+    vol_ratio_val       = volume_ratio(df)
+    rsi_div             = rsi_divergence(df, rsi_series)
+    ema_conf            = ema_confluence(df)
 
-    # AI
+    # SMC / Liq / Flow / LSTM
     smc_data = smc(df)
-    liq = liquidity(df)
-    fl = flow(df)
-    lstm = lstm_prediction(df)
+    liq      = liquidity(df)
+    fl       = flow(df)
+    lstm     = lstm_prediction(df)
 
-    score = ai_score(
-        lstm,
-        smc_data,
-        liq,
-        fl
+    score  = ai_score(
+        lstm, smc_data, liq, fl, rsi_val, macd_hist_val,
+        ema_conf, rsi_div, vol_ratio_val, stoch_k_val, bb_pos
     )
-
-    action = (
-        "BUY"
-        if score >= 55
-        else "SELL"
-    )
-
-    price = float(close.iloc[-1])
-
-    if action == "BUY":
-
-        tp = price + (price * 0.01)
-        sl = price - (price * 0.01)
-
-    else:
-
-        tp = price - (price * 0.01)
-        sl = price + (price * 0.01)
+    action = "BUY" if score >= 55 else "SELL"
+    tp, sl = tp_sl_from_atr(df, action, atr_val)
+    price  = float(close.iloc[-1])
+    rr     = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
 
     return {
-        "pair": pair,
-        "score": score,
-        "action": action,
-        "entry": price,
-        "tp": tp,
-        "sl": sl,
-        "rsi": rsi_value,
-        "macd": macd_value,
-        "lstm": lstm,
-        "smc": smc_data,
-        "liq": liq,
-        "flow": fl,
-        "df": df
+        "pair":      pair,
+        "timeframe": timeframe,
+        "score":     score,
+        "confidence":confidence_label(score),
+        "action":    action,
+        "entry":     price,
+        "tp":        tp,
+        "sl":        sl,
+        "rr":        rr,
+        "rsi":       rsi_val,
+        "macd":      macd_hist_val,
+        "atr":       atr_val,
+        "stoch_k":   stoch_k_val,
+        "bb_pos":    bb_pos,
+        "vol_ratio": vol_ratio_val,
+        "rsi_div":   rsi_div,
+        "ema":       ema_conf,
+        "lstm":      lstm,
+        "smc":       smc_data,
+        "liq":       liq,
+        "flow":      fl,
+        "df":        df,
     }
 
 # ==================================================
-# FORMAT SIGNAL
+# FORMAT SIGNAL (Discord Embed)
 # ==================================================
-def format_signal(data):
+def build_embed(data: dict) -> discord.Embed:
+    action_color = discord.Color.green() if data["action"] == "BUY" else discord.Color.red()
+    action_emoji = "🟢" if data["action"] == "BUY" else "🔴"
 
-    return f"""
-📊 {data['pair']} AI INSTITUTIONAL SIGNAL
-
-🧠 AI SCORE: {data['score']}%
-
-📈 LSTM: {data['lstm']}
-📊 RSI: {data['rsi']:.2f}
-📊 MACD: {data['macd']:.2f}
-
-🏗 BOS: {data['smc']['BOS']}
-🔄 CHoCH: {data['smc']['CHoCH']}
-💧 LIQ: {data['smc']['LIQ']}
-
-💧 Pressure: {data['liq']['PRESSURE']}
-🏦 Flow: {data['flow']['FLOW']}
-
-🟢 ACTION: {data['action']}
-
-📍 ENTRY: {data['entry']:.4f}
-🎯 TP: {data['tp']:.4f}
-🛑 SL: {data['sl']:.4f}
-
-⏱ TF: {TIMEFRAME}
-"""
+    embed = discord.Embed(
+        title       = f"{action_emoji} {data['pair']} — {data['action']} SIGNAL",
+        description = f"**AI Score:** `{data['score']}%` — {data['confidence']}",
+        color       = action_color,
+    )
+    embed.add_field(
+        name  = "📍 Entry / 🎯 TP / 🛑 SL",
+        value = (
+            f"`{data['entry']:.4f}` / `{data['tp']:.4f}` / `{data['sl']:.4f}`\n"
+            f"**R:R** → `1:{data['rr']:.2f}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name  = "📊 Indicators",
+        value = (
+            f"RSI: `{data['rsi']:.1f}` | MACD Hist: `{data['macd']:.4f}`\n"
+            f"Stoch K: `{data['stoch_k']:.1f}` | ATR: `{data['atr']:.4f}`\n"
+            f"Vol Ratio: `{data['vol_ratio']:.2f}x` | BB Pos: `{data['bb_pos']:.2f}`"
+        ),
+        inline=False,
+    )
+    div_text = {"BULLISH_DIV": "🔼 Bullish", "BEARISH_DIV": "🔽 Bearish", "NONE": "—"}
+    embed.add_field(
+        name  = "🧠 AI Analysis",
+        value = (
+            f"LSTM: `{data['lstm']}` | RSI Div: `{div_text[data['rsi_div']]}`\n"
+            f"EMA Stack: `{'🐂 Bull' if data['ema']['BULLISH_STACK'] else '🐻 Bear' if data['ema']['BEARISH_STACK'] else 'Mixed'}`\n"
+            f"BOS: `{data['smc']['BOS']}` | CHoCH: `{data['smc']['CHoCH']}` | OB: `{data['smc']['ORDER_BLOCK']}`\n"
+            f"Liq Pressure: `{data['liq']['PRESSURE']}` | Flow: `{data['flow']['FLOW']}`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"⏱ TF: {data['timeframe'].upper()} | Powered by AI Institutional Engine")
+    return embed
 
 # ==================================================
-# CREATE CANDLE CHART
+# CHART
 # ==================================================
-def create_chart(df, pair, entry, tp, sl):
-
+def create_chart(df: pd.DataFrame, pair: str, entry: float, tp: float, sl: float) -> str:
     df_chart = df.copy()
-
     df_chart.index.name = "Date"
 
-    # EMA
-    df_chart["EMA20"] = ema(df_chart["Close"], 20)
-    df_chart["EMA50"] = ema(df_chart["Close"], 50)
+    close = df_chart["Close"]
+    df_chart["EMA8"]  = ema(close, 8)
+    df_chart["EMA21"] = ema(close, 21)
+    df_chart["EMA50"] = ema(close, 50)
 
     addplots = [
-
-        mpf.make_addplot(
-            df_chart["EMA20"]
-        ),
-
-        mpf.make_addplot(
-            df_chart["EMA50"]
-        ),
-
-        mpf.make_addplot(
-            [entry] * len(df_chart),
-            linestyle="--"
-        ),
-
-        mpf.make_addplot(
-            [tp] * len(df_chart),
-            linestyle="--"
-        ),
-
-        mpf.make_addplot(
-            [sl] * len(df_chart),
-            linestyle="--"
-        )
+        mpf.make_addplot(df_chart["EMA8"],  color="cyan",   width=1.0),
+        mpf.make_addplot(df_chart["EMA21"], color="yellow", width=1.0),
+        mpf.make_addplot(df_chart["EMA50"], color="orange", width=1.2),
+        mpf.make_addplot([entry] * len(df_chart), color="white",  linestyle="--", width=0.8),
+        mpf.make_addplot([tp]    * len(df_chart), color="lime",   linestyle="--", width=0.8),
+        mpf.make_addplot([sl]    * len(df_chart), color="red",    linestyle="--", width=0.8),
     ]
 
     filename = f"{pair}_candles.png"
-
     mpf.plot(
         df_chart,
-        type="candle",
-        style="charles",
-        volume=False,
-        title=f"{pair} 5M SIGNAL",
-        addplot=addplots,
-        savefig=filename
+        type    = "candle",
+        style   = "charles",
+        volume  = "Volume" in df_chart.columns and df_chart["Volume"].sum() > 0,
+        title   = f"{pair} Signal Chart",
+        addplot = addplots,
+        savefig = filename,
     )
-
     return filename
 
 # ==================================================
-# /SIGNAL
+# UI VIEWS
 # ==================================================
-@client.tree.command(
-    name="signal",
-    description="Best AI signal scanner"
-)
-async def signal(interaction: discord.Interaction):
 
-    await interaction.response.defer()
+# ── Pair selector dropdown ────────────────────────
+class PairSelectView(View):
+    def __init__(self, timeframe: str = DEFAULT_TF, mode: str = "signal"):
+        super().__init__(timeout=60)
+        self.timeframe = timeframe
+        self.mode      = mode   # "signal" | "chart"
 
-    best_signal = None
-    best_score = -999
+        options = [
+            discord.SelectOption(label=p, description=PAIRS[p], emoji="📈")
+            for p in PAIRS
+        ]
+        select = Select(
+            placeholder = "Pilih pair...",
+            options     = options,
+        )
+        select.callback = self.on_pair_select
+        self.add_item(select)
 
-    for pair in PAIRS.keys():
+    async def on_pair_select(self, interaction: discord.Interaction):
+        pair = interaction.data["values"][0]
+        await interaction.response.defer()
+        await send_signal_or_chart(interaction, pair, self.timeframe, self.mode)
 
+# ── Timeframe selector dropdown ───────────────────
+class TimeframeSelectView(View):
+    def __init__(self, pair: str, mode: str = "signal"):
+        super().__init__(timeout=60)
+        self.pair = pair
+        self.mode = mode
+
+        options = [
+            discord.SelectOption(label=tf.upper(), value=tf, description=f"Interval {tf}")
+            for tf in TIMEFRAMES
+        ]
+        select = Select(placeholder="Pilih timeframe...", options=options)
+        select.callback = self.on_tf_select
+        self.add_item(select)
+
+    async def on_tf_select(self, interaction: discord.Interaction):
+        tf = interaction.data["values"][0]
+        await interaction.response.defer()
+        await send_signal_or_chart(interaction, self.pair, tf, self.mode)
+
+# ── Signal result buttons ─────────────────────────
+class SignalActionView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=120)
+        self.data = data
+
+    @discord.ui.button(label="📊 Candle Chart", style=discord.ButtonStyle.primary)
+    async def show_chart(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer()
+        d    = self.data
+        path = create_chart(d["df"], d["pair"], d["entry"], d["tp"], d["sl"])
+        await interaction.followup.send(
+            f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
+            file=discord.File(path),
+        )
+
+    @discord.ui.button(label="🔄 Rescan Pair Ini", style=discord.ButtonStyle.secondary)
+    async def rescan(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer()
+        new_data = generate_signal(self.data["pair"], self.data["timeframe"])
+        embed    = build_embed(new_data)
+        view     = SignalActionView(new_data)
+        await interaction.followup.send(embed=embed, view=view)
+
+    @discord.ui.button(label="📋 Ganti Timeframe", style=discord.ButtonStyle.secondary)
+    async def change_tf(self, interaction: discord.Interaction, button: Button):
+        view = TimeframeSelectView(self.data["pair"], mode="signal")
+        await interaction.response.send_message(
+            "⏱ Pilih timeframe:", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="🏆 Best Signal Semua Pair", style=discord.ButtonStyle.success)
+    async def best_signal(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer()
+        await scan_best_and_send(interaction, self.data["timeframe"])
+
+# ── Main menu buttons ─────────────────────────────
+class MainMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="🏆 Best Signal", style=discord.ButtonStyle.success, row=0)
+    async def best_signal(self, interaction: discord.Interaction, button: Button):
+        # First show TF selector
+        view = TimeframeSelectMenu(mode="best")
+        await interaction.response.send_message("⏱ Pilih timeframe:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="📈 Signal per Pair", style=discord.ButtonStyle.primary, row=0)
+    async def signal_pair(self, interaction: discord.Interaction, button: Button):
+        view = PairSelectView(mode="signal")
+        await interaction.response.send_message("📈 Pilih pair:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="📊 Chart per Pair", style=discord.ButtonStyle.primary, row=0)
+    async def chart_pair(self, interaction: discord.Interaction, button: Button):
+        view = PairSelectView(mode="chart")
+        await interaction.response.send_message("📊 Pilih pair untuk chart:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="🔁 Scan Semua Pair", style=discord.ButtonStyle.secondary, row=1)
+    async def scan_all(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer()
+        await scan_all_pairs_and_send(interaction, DEFAULT_TF)
+
+    @discord.ui.button(label="⚙️ Auto Signal Toggle", style=discord.ButtonStyle.danger, row=1)
+    async def toggle_auto(self, interaction: discord.Interaction, button: Button):
+        global AUTO_SIGNAL
+        AUTO_SIGNAL = not AUTO_SIGNAL
+        status = "🟢 AKTIF" if AUTO_SIGNAL else "🔴 MATI"
+        await interaction.response.send_message(
+            f"Auto Signal sekarang: **{status}**", ephemeral=True
+        )
+
+class TimeframeSelectMenu(View):
+    """Standalone TF picker for best-signal mode."""
+    def __init__(self, mode: str = "best"):
+        super().__init__(timeout=60)
+        self.mode = mode
+        options = [
+            discord.SelectOption(label=tf.upper(), value=tf)
+            for tf in TIMEFRAMES
+        ]
+        sel = Select(placeholder="Pilih timeframe...", options=options)
+        sel.callback = self.on_select
+        self.add_item(sel)
+
+    async def on_select(self, interaction: discord.Interaction):
+        tf = interaction.data["values"][0]
+        await interaction.response.defer()
+        await scan_best_and_send(interaction, tf)
+
+# ==================================================
+# HELPER: send signal or chart
+# ==================================================
+async def send_signal_or_chart(
+    interaction: discord.Interaction,
+    pair: str,
+    timeframe: str,
+    mode: str,
+):
+    data = generate_signal(pair, timeframe)
+
+    if mode == "chart":
+        path = create_chart(data["df"], pair, data["entry"], data["tp"], data["sl"])
+        await interaction.followup.send(
+            f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
+            file=discord.File(path),
+        )
+    else:
+        embed = build_embed(data)
+        view  = SignalActionView(data)
+        await interaction.followup.send(embed=embed, view=view)
+
+# ==================================================
+# HELPER: scan best pair
+# ==================================================
+async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
+    best, best_score = None, -1
+    for pair in PAIRS:
         try:
-
-            signal_data = generate_signal(pair)
-
-            if signal_data["score"] > best_score:
-
-                best_score = signal_data["score"]
-                best_signal = signal_data
-
+            d = generate_signal(pair, timeframe)
+            if d["score"] > best_score:
+                best_score, best = d["score"], d
         except Exception as e:
-
             print(f"ERROR {pair}: {e}")
 
-    if best_signal is None:
-
-        await interaction.followup.send(
-            "❌ Tidak ada signal tersedia."
-        )
+    if not best:
+        await interaction.followup.send("❌ Tidak ada signal tersedia.")
         return
 
-    chart_file = create_chart(
-        best_signal["df"],
-        best_signal["pair"],
-        best_signal["entry"],
-        best_signal["tp"],
-        best_signal["sl"]
-    )
-
-    await interaction.followup.send(
-        format_signal(best_signal),
-        file=discord.File(chart_file)
-    )
+    path  = create_chart(best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
+    embed = build_embed(best)
+    view  = SignalActionView(best)
+    await interaction.followup.send(embed=embed, view=view, file=discord.File(path))
 
 # ==================================================
-# /SHOW_TREND_CHART
+# HELPER: scan all pairs
 # ==================================================
-@client.tree.command(
-    name="show_trend_chart",
-    description="Show trend chart pair"
-)
-async def show_chart(
-    interaction: discord.Interaction,
-    pair: str
-):
+async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: str):
+    lines = []
+    for pair in PAIRS:
+        try:
+            d      = generate_signal(pair, timeframe)
+            emoji  = "🟢" if d["action"] == "BUY" else "🔴"
+            lines.append(
+                f"{emoji} **{pair}** | Score: `{d['score']}%` | {d['confidence']}"
+                f" | Entry: `{d['entry']:.4f}`"
+            )
+        except Exception as e:
+            lines.append(f"⚠️ **{pair}** error: {e}")
 
-    pair = pair.upper()
+    embed = discord.Embed(
+        title       = f"🔁 Scan Semua Pair — {timeframe.upper()}",
+        description = "\n".join(lines),
+        color       = discord.Color.blurple(),
+    )
+    embed.set_footer(text="Klik '📈 Signal per Pair' untuk detail sinyal per pair")
+    await interaction.followup.send(embed=embed)
 
-    if pair not in PAIRS:
+# ==================================================
+# SLASH COMMANDS
+# ==================================================
 
+@client.tree.command(name="menu", description="Buka menu utama AI Trading Bot")
+async def menu(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title       = "🤖 AI Institutional Trading Bot",
+        description = "Pilih aksi yang ingin kamu lakukan:",
+        color       = discord.Color.gold(),
+    )
+    embed.add_field(name="🏆 Best Signal",       value="Sinyal terbaik dari semua pair",          inline=False)
+    embed.add_field(name="📈 Signal per Pair",   value="Sinyal spesifik untuk satu pair",         inline=False)
+    embed.add_field(name="📊 Chart per Pair",    value="Candle chart tanpa sinyal",                inline=False)
+    embed.add_field(name="🔁 Scan Semua Pair",   value="Ringkasan cepat semua pair",              inline=False)
+    embed.add_field(name="⚙️ Auto Signal Toggle","Aktifkan/matikan auto-signal otomatis",         inline=False)
+    await interaction.response.send_message(embed=embed, view=MainMenuView())
+
+@client.tree.command(name="signal", description="Best AI signal dari semua pair")
+@app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
+async def signal_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_TF):
+    if timeframe not in TIMEFRAMES:
         await interaction.response.send_message(
-            f"""
-❌ Pair tidak tersedia.
-
-Available:
-{', '.join(PAIRS.keys())}
-"""
+            f"❌ Timeframe tidak valid. Pilih: {', '.join(TIMEFRAMES.keys())}", ephemeral=True
         )
         return
-
     await interaction.response.defer()
+    await scan_best_and_send(interaction, timeframe)
 
-    signal_data = generate_signal(pair)
+@client.tree.command(name="pair", description="Sinyal AI untuk pair tertentu")
+@app_commands.describe(pair="Contoh: BTCUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
+async def pair_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
+    pair = pair.upper()
+    if pair not in PAIRS:
+        await interaction.response.send_message(
+            f"❌ Pair tidak tersedia.\nAvailable: {', '.join(PAIRS.keys())}", ephemeral=True
+        )
+        return
+    if timeframe not in TIMEFRAMES:
+        await interaction.response.send_message(
+            f"❌ Timeframe tidak valid. Pilih: {', '.join(TIMEFRAMES.keys())}", ephemeral=True
+        )
+        return
+    await interaction.response.defer()
+    await send_signal_or_chart(interaction, pair, timeframe, mode="signal")
 
-    chart_file = create_chart(
-        signal_data["df"],
-        pair,
-        signal_data["entry"],
-        signal_data["tp"],
-        signal_data["sl"]
-    )
+@client.tree.command(name="chart", description="Candle chart pair tertentu")
+@app_commands.describe(pair="Contoh: ETHUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
+async def chart_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
+    pair = pair.upper()
+    if pair not in PAIRS:
+        await interaction.response.send_message(
+            f"❌ Pair tidak tersedia.\nAvailable: {', '.join(PAIRS.keys())}", ephemeral=True
+        )
+        return
+    await interaction.response.defer()
+    await send_signal_or_chart(interaction, pair, timeframe, mode="chart")
 
-    await interaction.followup.send(
-        f"📊 {pair} 5M Candle Chart",
-        file=discord.File(chart_file)
-    )
+@client.tree.command(name="scanall", description="Scan semua pair sekaligus")
+@app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
+async def scanall_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_TF):
+    await interaction.response.defer()
+    await scan_all_pairs_and_send(interaction, timeframe)
 
-# ==================================================
-# /AUTO_TOGGLE
-# ==================================================
-@client.tree.command(
-    name="auto_toggle",
-    description="Toggle auto signal"
-)
-async def auto_toggle(interaction: discord.Interaction):
-
+@client.tree.command(name="auto", description="Toggle auto signal (on/off)")
+async def auto_cmd(interaction: discord.Interaction):
     global AUTO_SIGNAL
-
     AUTO_SIGNAL = not AUTO_SIGNAL
-
-    await interaction.response.send_message(
-        f"AUTO SIGNAL: {AUTO_SIGNAL}"
-    )
+    status = "🟢 AKTIF" if AUTO_SIGNAL else "🔴 MATI"
+    await interaction.response.send_message(f"Auto Signal: **{status}**")
 
 # ==================================================
 # AUTO SIGNAL LOOP
 # ==================================================
 async def auto_signal_loop():
-
     await client.wait_until_ready()
-
     channel = client.get_channel(CHANNEL_ID)
 
     while not client.is_closed():
-
         try:
-
-            if AUTO_SIGNAL:
-
-                for pair in PAIRS.keys():
-
+            if AUTO_SIGNAL and channel:
+                for pair in PAIRS:
                     try:
-
-                        signal_data = generate_signal(pair)
-
-                        if signal_data["score"] >= 75:
-
-                            chart_file = create_chart(
-                                signal_data["df"],
-                                pair,
-                                signal_data["entry"],
-                                signal_data["tp"],
-                                signal_data["sl"]
-                            )
-
-                            await channel.send(
-                                format_signal(signal_data),
-                                file=discord.File(chart_file)
-                            )
-
+                        data = generate_signal(pair, DEFAULT_TF)
+                        if data["score"] >= AUTO_MIN_SCORE:
+                            path  = create_chart(data["df"], pair, data["entry"], data["tp"], data["sl"])
+                            embed = build_embed(data)
+                            view  = SignalActionView(data)
+                            await channel.send(embed=embed, view=view, file=discord.File(path))
                     except Exception as e:
-
                         print(f"AUTO ERROR {pair}: {e}")
 
-            await asyncio.sleep(900)
-
+            await asyncio.sleep(900)   # setiap 15 menit
         except Exception as e:
-
             print(f"LOOP ERROR: {e}")
-
             await asyncio.sleep(30)
 
 # ==================================================
@@ -527,22 +752,15 @@ async def auto_signal_loop():
 # ==================================================
 @client.event
 async def on_ready():
-
     await client.tree.sync()
-
-    print("V6 INSTITUTIONAL AI BOT READY")
+    print(f"✅ AI TRADING BOT READY — Logged in as {client.user}")
 
 # ==================================================
 # START
 # ==================================================
 async def main():
-
     async with client:
-
-        client.loop.create_task(
-            auto_signal_loop()
-        )
-
+        client.loop.create_task(auto_signal_loop())
         await client.start(TOKEN)
 
 asyncio.run(main())
