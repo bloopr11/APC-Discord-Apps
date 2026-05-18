@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ui import View, Button, Select
 import asyncio
 import os
+import functools
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -55,6 +56,16 @@ class Bot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
 client = Bot()
+
+# ==================================================
+# ASYNC HELPER — jalankan fungsi blocking di thread pool
+# agar event loop Discord tidak freeze saat download/chart
+# ==================================================
+async def run_blocking(func, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(func, *args, **kwargs)
+    )
 
 # ==================================================
 # MARKET DATA
@@ -475,10 +486,11 @@ class PairSelectView(View):
 
 # ── Timeframe selector dropdown ───────────────────
 class TimeframeSelectView(View):
-    def __init__(self, pair: str, mode: str = "signal"):
+    def __init__(self, pair: str, mode: str = "signal", channel_id: int = None):
         super().__init__(timeout=60)
-        self.pair = pair
-        self.mode = mode
+        self.pair       = pair
+        self.mode       = mode
+        self.channel_id = channel_id   # channel tujuan hasil signal
 
         options = [
             discord.SelectOption(label=tf.upper(), value=tf, description=f"Interval {tf}")
@@ -490,8 +502,34 @@ class TimeframeSelectView(View):
 
     async def on_tf_select(self, interaction: discord.Interaction):
         tf = interaction.data["values"][0]
-        await interaction.response.defer()
-        await send_signal_or_chart(interaction, self.pair, tf, self.mode)
+        # acknowledge dulu agar tidak timeout
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(
+            f"⏳ Memproses `{self.pair}` `{tf.upper()}`...", ephemeral=True
+        )
+
+        # kirim hasil ke channel asli, bukan ephemeral
+        channel = (
+            interaction.channel
+            if self.channel_id is None
+            else interaction.client.get_channel(self.channel_id)
+        )
+        try:
+            data  = await run_blocking(generate_signal, self.pair, tf)
+            embed = build_embed(data)
+            view  = SignalActionView(data)
+            if self.mode == "chart":
+                path = await run_blocking(
+                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"]
+                )
+                await channel.send(
+                    f"📊 **{self.pair}** `{tf.upper()}` Candle Chart",
+                    file=discord.File(path),
+                )
+            else:
+                await channel.send(embed=embed, view=view)
+        except Exception as e:
+            await channel.send(f"❌ Error `{self.pair}` `{tf}`: {e}")
 
 # ── Signal result buttons ─────────────────────────
 class SignalActionView(View):
@@ -503,23 +541,33 @@ class SignalActionView(View):
     async def show_chart(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
         d    = self.data
-        path = create_chart(d["df"], d["pair"], d["entry"], d["tp"], d["sl"])
-        await interaction.followup.send(
-            f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
-            file=discord.File(path),
-        )
+        try:
+            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"])
+            await interaction.followup.send(
+                f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
+                file=discord.File(path),
+            )
+        except Exception as e:
+            await interaction.followup.send(f"❌ Gagal buat chart: `{e}`")
 
     @discord.ui.button(label="🔄 Rescan Pair Ini", style=discord.ButtonStyle.secondary)
     async def rescan(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
-        new_data = generate_signal(self.data["pair"], self.data["timeframe"])
-        embed    = build_embed(new_data)
-        view     = SignalActionView(new_data)
-        await interaction.followup.send(embed=embed, view=view)
+        try:
+            new_data = await run_blocking(generate_signal, self.data["pair"], self.data["timeframe"])
+            embed    = build_embed(new_data)
+            view     = SignalActionView(new_data)
+            await interaction.followup.send(embed=embed, view=view)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Gagal rescan: `{e}`")
 
     @discord.ui.button(label="📋 Ganti Timeframe", style=discord.ButtonStyle.secondary)
     async def change_tf(self, interaction: discord.Interaction, button: Button):
-        view = TimeframeSelectView(self.data["pair"], mode="signal")
+        view = TimeframeSelectView(
+            self.data["pair"],
+            mode       = "signal",
+            channel_id = interaction.channel_id,
+        )
         await interaction.response.send_message(
             "⏱ Pilih timeframe:", view=view, ephemeral=True
         )
@@ -565,7 +613,7 @@ class MainMenuView(View):
         )
 
 class TimeframeSelectMenu(View):
-    """Standalone TF picker for best-signal mode."""
+    """Standalone TF picker untuk best-signal mode."""
     def __init__(self, mode: str = "best"):
         super().__init__(timeout=60)
         self.mode = mode
@@ -579,8 +627,28 @@ class TimeframeSelectMenu(View):
 
     async def on_select(self, interaction: discord.Interaction):
         tf = interaction.data["values"][0]
-        await interaction.response.defer()
-        await scan_best_and_send(interaction, tf)
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(
+            f"⏳ Mencari best signal `{tf.upper()}`...", ephemeral=True
+        )
+        channel = interaction.channel
+        best, best_score = None, -1
+        for pair in PAIRS:
+            try:
+                d = await run_blocking(generate_signal, pair, tf)
+                if d["score"] > best_score:
+                    best_score, best = d["score"], d
+            except Exception as e:
+                print(f"TF MENU ERROR {pair}: {e}")
+
+        if not best:
+            await channel.send("❌ Tidak ada signal tersedia.")
+            return
+
+        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
+        embed = build_embed(best)
+        view  = SignalActionView(best)
+        await channel.send(embed=embed, view=view, file=discord.File(path))
 
 # ==================================================
 # HELPER: send signal or chart
@@ -591,18 +659,26 @@ async def send_signal_or_chart(
     timeframe: str,
     mode: str,
 ):
-    data = generate_signal(pair, timeframe)
+    try:
+        # jalankan di thread pool agar tidak freeze event loop
+        data = await run_blocking(generate_signal, pair, timeframe)
 
-    if mode == "chart":
-        path = create_chart(data["df"], pair, data["entry"], data["tp"], data["sl"])
-        await interaction.followup.send(
-            f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
-            file=discord.File(path),
-        )
-    else:
-        embed = build_embed(data)
-        view  = SignalActionView(data)
-        await interaction.followup.send(embed=embed, view=view)
+        if mode == "chart":
+            path = await run_blocking(
+                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"]
+            )
+            await interaction.followup.send(
+                f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
+                file=discord.File(path),
+            )
+        else:
+            embed = build_embed(data)
+            view  = SignalActionView(data)
+            await interaction.followup.send(embed=embed, view=view)
+
+    except Exception as e:
+        print(f"send_signal_or_chart ERROR [{pair}|{timeframe}]: {e}")
+        await interaction.followup.send(f"❌ Error memproses {pair}: `{e}`")
 
 # ==================================================
 # HELPER: scan best pair
@@ -611,7 +687,7 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
     best, best_score = None, -1
     for pair in PAIRS:
         try:
-            d = generate_signal(pair, timeframe)
+            d = await run_blocking(generate_signal, pair, timeframe)
             if d["score"] > best_score:
                 best_score, best = d["score"], d
         except Exception as e:
@@ -621,7 +697,7 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
         await interaction.followup.send("❌ Tidak ada signal tersedia.")
         return
 
-    path  = create_chart(best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
+    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
     embed = build_embed(best)
     view  = SignalActionView(best)
     await interaction.followup.send(embed=embed, view=view, file=discord.File(path))
@@ -633,7 +709,7 @@ async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: s
     lines = []
     for pair in PAIRS:
         try:
-            d      = generate_signal(pair, timeframe)
+            d      = await run_blocking(generate_signal, pair, timeframe)
             emoji  = "🟢" if d["action"] == "BUY" else "🔴"
             lines.append(
                 f"{emoji} **{pair}** | Score: `{d['score']}%` | {d['confidence']}"
@@ -733,9 +809,9 @@ async def auto_signal_loop():
             if AUTO_SIGNAL and channel:
                 for pair in PAIRS:
                     try:
-                        data = generate_signal(pair, DEFAULT_TF)
+                        data = await run_blocking(generate_signal, pair, DEFAULT_TF)
                         if data["score"] >= AUTO_MIN_SCORE:
-                            path  = create_chart(data["df"], pair, data["entry"], data["tp"], data["sl"])
+                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"])
                             embed = build_embed(data)
                             view  = SignalActionView(data)
                             await channel.send(embed=embed, view=view, file=discord.File(path))
