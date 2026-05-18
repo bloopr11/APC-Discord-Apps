@@ -431,6 +431,10 @@ def create_chart(df: pd.DataFrame, pair: str, entry: float, tp: float, sl: float
     df_chart = df.copy()
     df_chart.index.name = "Date"
 
+    # pastikan index bertipe DatetimeIndex
+    if not isinstance(df_chart.index, pd.DatetimeIndex):
+        df_chart.index = pd.to_datetime(df_chart.index)
+
     close = df_chart["Close"]
     df_chart["EMA8"]  = ema(close, 8)
     df_chart["EMA21"] = ema(close, 21)
@@ -446,14 +450,17 @@ def create_chart(df: pd.DataFrame, pair: str, entry: float, tp: float, sl: float
     ]
 
     filename = f"{pair}_candles.png"
+
+    # volume=True tidak valid di versi mplfinance terbaru — selalu False
+    # volume panel di-skip untuk menghindari validator error
     mpf.plot(
         df_chart,
         type    = "candle",
         style   = "charles",
-        volume  = "Volume" in df_chart.columns and df_chart["Volume"].sum() > 0,
+        volume  = False,
         title   = f"{pair} Signal Chart",
         addplot = addplots,
-        savefig = filename,
+        savefig = dict(fname=filename, dpi=150, bbox_inches="tight"),
     )
     return filename
 
@@ -575,6 +582,7 @@ class SignalActionView(View):
     @discord.ui.button(label="🏆 Best Signal Semua Pair", style=discord.ButtonStyle.success)
     async def best_signal(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
+        await interaction.followup.send(f"⏳ Scanning semua pair `{self.data['timeframe'].upper()}`...")
         await scan_best_and_send(interaction, self.data["timeframe"])
 
 # ── Main menu buttons ─────────────────────────────
@@ -601,6 +609,7 @@ class MainMenuView(View):
     @discord.ui.button(label="🔁 Scan Semua Pair", style=discord.ButtonStyle.secondary, row=1)
     async def scan_all(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
+        await interaction.followup.send("⏳ Scanning semua pair...")
         await scan_all_pairs_and_send(interaction, DEFAULT_TF)
 
     @discord.ui.button(label="⚙️ Auto Signal Toggle", style=discord.ButtonStyle.danger, row=1)
@@ -632,19 +641,22 @@ class TimeframeSelectMenu(View):
             f"⏳ Mencari best signal `{tf.upper()}`...", ephemeral=True
         )
         channel = interaction.channel
-        best, best_score = None, -1
-        for pair in PAIRS:
+
+        async def _safe(pair):
             try:
-                d = await run_blocking(generate_signal, pair, tf)
-                if d["score"] > best_score:
-                    best_score, best = d["score"], d
+                return await run_blocking(generate_signal, pair, tf)
             except Exception as e:
                 print(f"TF MENU ERROR {pair}: {e}")
+                return None
 
-        if not best:
+        results = await asyncio.gather(*[_safe(p) for p in PAIRS])
+        results = [r for r in results if r is not None]
+
+        if not results:
             await channel.send("❌ Tidak ada signal tersedia.")
             return
 
+        best  = max(results, key=lambda x: x["score"])
         path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
         embed = build_embed(best)
         view  = SignalActionView(best)
@@ -684,19 +696,22 @@ async def send_signal_or_chart(
 # HELPER: scan best pair
 # ==================================================
 async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
-    best, best_score = None, -1
-    for pair in PAIRS:
+    # scan semua pair secara concurrent (bukan sequential)
+    async def _safe_signal(pair):
         try:
-            d = await run_blocking(generate_signal, pair, timeframe)
-            if d["score"] > best_score:
-                best_score, best = d["score"], d
+            return await run_blocking(generate_signal, pair, timeframe)
         except Exception as e:
-            print(f"ERROR {pair}: {e}")
+            print(f"SCAN ERROR {pair}: {e}")
+            return None
 
-    if not best:
+    results = await asyncio.gather(*[_safe_signal(p) for p in PAIRS])
+    results = [r for r in results if r is not None]
+
+    if not results:
         await interaction.followup.send("❌ Tidak ada signal tersedia.")
         return
 
+    best = max(results, key=lambda x: x["score"])
     path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
     embed = build_embed(best)
     view  = SignalActionView(best)
@@ -706,17 +721,24 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
 # HELPER: scan all pairs
 # ==================================================
 async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: str):
-    lines = []
-    for pair in PAIRS:
+    async def _safe_signal(pair):
         try:
-            d      = await run_blocking(generate_signal, pair, timeframe)
-            emoji  = "🟢" if d["action"] == "BUY" else "🔴"
+            return pair, await run_blocking(generate_signal, pair, timeframe), None
+        except Exception as e:
+            return pair, None, str(e)
+
+    results = await asyncio.gather(*[_safe_signal(p) for p in PAIRS])
+
+    lines = []
+    for pair, d, err in results:
+        if err:
+            lines.append(f"⚠️ **{pair}** error: {err}")
+        else:
+            emoji = "🟢" if d["action"] == "BUY" else "🔴"
             lines.append(
                 f"{emoji} **{pair}** | Score: `{d['score']}%` | {d['confidence']}"
                 f" | Entry: `{d['entry']:.4f}`"
             )
-        except Exception as e:
-            lines.append(f"⚠️ **{pair}** error: {e}")
 
     embed = discord.Embed(
         title       = f"🔁 Scan Semua Pair — {timeframe.upper()}",
@@ -753,6 +775,7 @@ async def signal_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_
         )
         return
     await interaction.response.defer()
+    await interaction.followup.send(f"⏳ Scanning semua pair `{timeframe.upper()}`...", ephemeral=False)
     await scan_best_and_send(interaction, timeframe)
 
 @client.tree.command(name="pair", description="Sinyal AI untuk pair tertentu")
@@ -788,6 +811,7 @@ async def chart_cmd(interaction: discord.Interaction, pair: str, timeframe: str 
 @app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
 async def scanall_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_TF):
     await interaction.response.defer()
+    await interaction.followup.send(f"⏳ Scanning semua pair `{timeframe.upper()}`...")
     await scan_all_pairs_and_send(interaction, timeframe)
 
 @client.tree.command(name="auto", description="Toggle auto signal (on/off)")
