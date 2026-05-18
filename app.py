@@ -303,16 +303,85 @@ def confidence_label(score: int) -> str:
     return "❌ LOW"
 
 # ==================================================
-# ATR-BASED TP/SL
+# LIQUIDITY POOL ZONES  (swing highs / swing lows)
 # ==================================================
-def tp_sl_from_atr(df: pd.DataFrame, action: str, atr_val: float):
-    price = float(df["Close"].iloc[-1])
-    mult_tp = 2.0   # 2× ATR TP
-    mult_sl = 1.0   # 1× ATR SL  → RR 1:2
+def liquidity_pools(df: pd.DataFrame, swing: int = 20):
+    """
+    Kembalikan zona likuiditas utama:
+    - buy_side_liq  : kumpulan stop-loss BUY yang tersimpan di bawah swing low
+                      (target stop-hunt oleh market maker saat harga turun)
+    - sell_side_liq : kumpulan stop-loss SELL yang tersimpan di atas swing high
+                      (target stop-hunt saat harga naik)
+    Masing-masing berupa (level_harga, buffer_bawah, buffer_atas)
+    """
+    high = df["High"]
+    low  = df["Low"]
+    atr_now = float(df["High"].rolling(14).mean().iloc[-1] -
+                    df["Low"].rolling(14).mean().iloc[-1])
+
+    # Swing low = titik terendah dalam window → di sinilah SL retail BUY menumpuk
+    swing_low  = float(low.rolling(swing).min().iloc[-1])
+    # Swing high = titik tertinggi → di sinilah SL retail SELL menumpuk
+    swing_high = float(high.rolling(swing).max().iloc[-1])
+
+    # Buffer kecil di luar pool agar SL kita melewati zona sweep
+    buf = atr_now * 0.3
+
+    return {
+        "buy_side_liq":  swing_low,   # pool SL di bawah → rawan di-sweep ke bawah
+        "sell_side_liq": swing_high,  # pool SL di atas  → rawan di-sweep ke atas
+        "buf":           buf,
+        "swing":         swing,
+    }
+
+# ==================================================
+# ANTI-LIQUIDITY-SWEEP TP / SL
+# ==================================================
+def tp_sl_anti_sweep(df: pd.DataFrame, action: str, atr_val: float):
+    """
+    SL ditempatkan BEYOND liquidity pool, bukan di dalam pool.
+    Artinya SL kita sudah di luar zona di mana market maker biasanya
+    melakukan stop-hunt, sehingga tidak mudah tersapu (sweep).
+
+    BUY  → SL di bawah swing_low - buffer  (melewati pool SL retail)
+    SELL → SL di atas  swing_high + buffer  (melewati pool SL retail)
+
+    TP menggunakan 2.5× jarak SL dari entry agar RR minimal 1:2.5
+    """
+    price  = float(df["Close"].iloc[-1])
+    pools  = liquidity_pools(df)
+
     if action == "BUY":
-        return price + mult_tp * atr_val, price - mult_sl * atr_val
+        # SL: di bawah liquidity pool bawah
+        raw_sl    = pools["buy_side_liq"] - pools["buf"]
+        # pastikan SL tidak terlalu jauh (max 3× ATR) — cegah SL absurd
+        sl        = max(raw_sl, price - 3.0 * atr_val)
+        sl_dist   = abs(price - sl)
+        tp        = price + 2.5 * sl_dist   # RR 1:2.5
+        sweep_ref = pools["buy_side_liq"]
+        sweep_dir = "below"
     else:
-        return price - mult_tp * atr_val, price + mult_sl * atr_val
+        # SL: di atas liquidity pool atas
+        raw_sl    = pools["sell_side_liq"] + pools["buf"]
+        sl        = min(raw_sl, price + 3.0 * atr_val)
+        sl_dist   = abs(price - sl)
+        tp        = price - 2.5 * sl_dist
+        sweep_ref = pools["sell_side_liq"]
+        sweep_dir = "above"
+
+    rr = abs(tp - price) / sl_dist if sl_dist > 0 else 0
+
+    return {
+        "tp":         tp,
+        "sl":         sl,
+        "rr":         rr,
+        "sl_dist":    sl_dist,
+        "sweep_ref":  sweep_ref,   # level pool likuiditas yang dijadikan acuan
+        "sweep_dir":  sweep_dir,   # "above" / "below"
+        "buf":        pools["buf"],
+        "buy_pool":   pools["buy_side_liq"],
+        "sell_pool":  pools["sell_side_liq"],
+    }
 
 # ==================================================
 # GENERATE SIGNAL
@@ -349,34 +418,37 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
         lstm, smc_data, liq, fl, rsi_val, macd_hist_val,
         ema_conf, rsi_div, vol_ratio_val, stoch_k_val, bb_pos
     )
-    action = "BUY" if score >= 55 else "SELL"
-    tp, sl = tp_sl_from_atr(df, action, atr_val)
-    price  = float(close.iloc[-1])
-    rr     = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
+    action   = "BUY" if score >= 55 else "SELL"
+    sl_data  = tp_sl_anti_sweep(df, action, atr_val)
+    tp       = sl_data["tp"]
+    sl       = sl_data["sl"]
+    price    = float(close.iloc[-1])
+    rr       = sl_data["rr"]
 
     return {
-        "pair":      pair,
-        "timeframe": timeframe,
-        "score":     score,
-        "confidence":confidence_label(score),
-        "action":    action,
-        "entry":     price,
-        "tp":        tp,
-        "sl":        sl,
-        "rr":        rr,
-        "rsi":       rsi_val,
-        "macd":      macd_hist_val,
-        "atr":       atr_val,
-        "stoch_k":   stoch_k_val,
-        "bb_pos":    bb_pos,
-        "vol_ratio": vol_ratio_val,
-        "rsi_div":   rsi_div,
-        "ema":       ema_conf,
-        "lstm":      lstm,
-        "smc":       smc_data,
-        "liq":       liq,
-        "flow":      fl,
-        "df":        df,
+        "pair":       pair,
+        "timeframe":  timeframe,
+        "score":      score,
+        "confidence": confidence_label(score),
+        "action":     action,
+        "entry":      price,
+        "tp":         tp,
+        "sl":         sl,
+        "rr":         rr,
+        "rsi":        rsi_val,
+        "macd":       macd_hist_val,
+        "atr":        atr_val,
+        "stoch_k":    stoch_k_val,
+        "bb_pos":     bb_pos,
+        "vol_ratio":  vol_ratio_val,
+        "rsi_div":    rsi_div,
+        "ema":        ema_conf,
+        "lstm":       lstm,
+        "smc":        smc_data,
+        "liq":        liq,
+        "flow":       fl,
+        "sweep":      sl_data,   # anti-sweep detail
+        "df":         df,
     }
 
 # ==================================================
@@ -385,6 +457,7 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
 def build_embed(data: dict) -> discord.Embed:
     action_color = discord.Color.green() if data["action"] == "BUY" else discord.Color.red()
     action_emoji = "🟢" if data["action"] == "BUY" else "🔴"
+    sw           = data["sweep"]
 
     embed = discord.Embed(
         title       = f"{action_emoji} {data['pair']} — {data['action']} SIGNAL",
@@ -396,6 +469,29 @@ def build_embed(data: dict) -> discord.Embed:
         value = (
             f"`{data['entry']:.4f}` / `{data['tp']:.4f}` / `{data['sl']:.4f}`\n"
             f"**R:R** → `1:{data['rr']:.2f}`"
+        ),
+        inline=False,
+    )
+
+    # ── Anti-Sweep SL detail ──────────────────────
+    sweep_side = "Buy-Side Pool (Swing Low)" if data["action"] == "BUY" else "Sell-Side Pool (Swing High)"
+    sweep_pos  = "di bawah" if data["action"] == "BUY" else "di atas"
+    embed.add_field(
+        name  = "🛡️ Anti Liquidity Sweep SL",
+        value = (
+            f"**Liquidity Pool:** `{sw['sweep_ref']:.4f}` ({sweep_side})\n"
+            f"**Buffer beyond pool:** `{sw['buf']:.4f}`\n"
+            f"**SL ditempatkan {sweep_pos} pool** → `{data['sl']:.4f}`\n"
+            f"*SL berada di luar zona stop-hunt market maker,\n"
+            f"sehingga tidak mudah tersapu (sweep) sebelum harga bergerak.*"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name  = "💧 Liquidity Zones",
+        value = (
+            f"Buy-Side Pool  (Swing Low):  `{sw['buy_pool']:.4f}`\n"
+            f"Sell-Side Pool (Swing High): `{sw['sell_pool']:.4f}`"
         ),
         inline=False,
     )
@@ -432,11 +528,11 @@ def create_chart(
     tp: float,
     sl: float,
     timeframe: str = DEFAULT_TF,
+    sweep_data: dict = None,   # dari tp_sl_anti_sweep()
 ) -> str:
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
-    import matplotlib.dates  as mdates
-    from matplotlib.patches import FancyArrowPatch
+    from matplotlib.lines import Line2D
 
     df_c = df.copy()
 
@@ -444,136 +540,270 @@ def create_chart(
     if not isinstance(df_c.index, pd.DatetimeIndex):
         df_c.index = pd.to_datetime(df_c.index)
 
-    # ── trim ke jumlah candle yang wajar per TF ──
-    candle_limit = {
-        "5m":  100,
-        "15m": 100,
-        "1h":  96,
-        "4h":  60,
-    }
-    n = candle_limit.get(timeframe, 100)
+    # ── trim ke jumlah candle per TF ─────────────
+    candle_limit = {"5m": 100, "15m": 100, "1h": 96, "4h": 60}
+    n    = candle_limit.get(timeframe, 100)
     df_c = df_c.iloc[-n:]
 
-    # ── hitung EMA ───────────────────────────────
+    # ── EMA ──────────────────────────────────────
     close = df_c["Close"]
     df_c["EMA8"]  = ema(close, 8)
     df_c["EMA21"] = ema(close, 21)
     df_c["EMA50"] = ema(close, 50)
 
-    # ── numeric x-axis ────────────────────────────
     xs     = np.arange(len(df_c))
     opens  = df_c["Open"].values
     highs  = df_c["High"].values
     lows   = df_c["Low"].values
     closes = df_c["Close"].values
 
-    # ── figure setup ─────────────────────────────
-    fig, ax = plt.subplots(figsize=(16, 8))
-    fig.patch.set_facecolor("#0d1117")
+    is_buy      = entry < tp
+    action_lbl  = "BUY" if is_buy else "SELL"
+
+    # ── figure: 2 baris (chart + info panel) ─────
+    fig = plt.figure(figsize=(18, 10), facecolor="#0d1117")
+    gs  = fig.add_gridspec(
+        2, 1, height_ratios=[5, 1],
+        hspace=0.06, left=0.01, right=0.86, top=0.93, bottom=0.08,
+    )
+    ax  = fig.add_subplot(gs[0])   # candle chart
+    ax2 = fig.add_subplot(gs[1])   # info bar bawah
+
     ax.set_facecolor("#0d1117")
+    ax2.set_facecolor("#0d1117")
+    ax2.axis("off")
 
-    # candle width — lebih ramping jika banyak candle
+    # ═══════════════════════════════════════════════
+    # LAYER 0 — Liquidity Pool Zones (jika ada)
+    # ═══════════════════════════════════════════════
+    if sweep_data:
+        buy_pool  = sweep_data["buy_pool"]
+        sell_pool = sweep_data["sell_pool"]
+        buf       = sweep_data["buf"]
+
+        # Buy-side liquidity pool (kuning transparan, bawah chart)
+        ax.axhspan(
+            buy_pool - buf * 2, buy_pool,
+            alpha=0.08, color="#ffd600", zorder=1,
+        )
+        ax.axhline(
+            buy_pool, color="#ffd600", linewidth=0.9,
+            linestyle=":", zorder=2, alpha=0.7,
+        )
+
+        # Sell-side liquidity pool (ungu transparan, atas chart)
+        ax.axhspan(
+            sell_pool, sell_pool + buf * 2,
+            alpha=0.08, color="#ce93d8", zorder=1,
+        )
+        ax.axhline(
+            sell_pool, color="#ce93d8", linewidth=0.9,
+            linestyle=":", zorder=2, alpha=0.7,
+        )
+
+        # Label pool di sisi kiri
+        ax.text(
+            0.2, buy_pool,
+            f" 💧 Buy-Side Pool  {buy_pool:.4f}",
+            color="#ffd600", fontsize=7.5, va="bottom", alpha=0.85,
+        )
+        ax.text(
+            0.2, sell_pool,
+            f" 💧 Sell-Side Pool  {sell_pool:.4f}",
+            color="#ce93d8", fontsize=7.5, va="top", alpha=0.85,
+        )
+
+    # ═══════════════════════════════════════════════
+    # LAYER 1 — TP Zone (hijau)
+    # ═══════════════════════════════════════════════
+    lo_tp, hi_tp = (entry, tp) if is_buy else (tp, entry)
+    ax.axhspan(lo_tp, hi_tp, alpha=0.13, color="#00c853", zorder=1)
+
+    # ═══════════════════════════════════════════════
+    # LAYER 2 — SL Zone (merah)  ← anti-sweep
+    # ═══════════════════════════════════════════════
+    lo_sl, hi_sl = (sl, entry) if is_buy else (entry, sl)
+    ax.axhspan(lo_sl, hi_sl, alpha=0.13, color="#d50000", zorder=1)
+
+    # Jika ada sweep_data: gambar "anti-sweep buffer" lebih gelap
+    if sweep_data:
+        sweep_ref = sweep_data["sweep_ref"]
+        if is_buy:
+            # buffer zone: sweep_ref s.d. sl  (zona di luar pool → tempat SL kita)
+            ax.axhspan(sl, sweep_ref, alpha=0.22, color="#b71c1c", zorder=1)
+            ax.axhline(sweep_ref, color="#ff6d00", linewidth=1.0,
+                       linestyle="-.", zorder=5, alpha=0.8)
+            ax.text(
+                xs[-1] + 0.5, sweep_ref,
+                f" 🟠 Liq Pool  {sweep_ref:.4f}",
+                color="#ff6d00", fontsize=7.5, va="center", fontweight="bold",
+            )
+        else:
+            ax.axhspan(sweep_ref, sl, alpha=0.22, color="#b71c1c", zorder=1)
+            ax.axhline(sweep_ref, color="#ff6d00", linewidth=1.0,
+                       linestyle="-.", zorder=5, alpha=0.8)
+            ax.text(
+                xs[-1] + 0.5, sweep_ref,
+                f" 🟠 Liq Pool  {sweep_ref:.4f}",
+                color="#ff6d00", fontsize=7.5, va="center", fontweight="bold",
+            )
+
+    # ═══════════════════════════════════════════════
+    # LAYER 3 — Candles
+    # ═══════════════════════════════════════════════
     w = 0.6
-
-    # ── draw candles ─────────────────────────────
     for i, x in enumerate(xs):
         o, h, l, c = opens[i], highs[i], lows[i], closes[i]
-        color = "#26a69a" if c >= o else "#ef5350"   # teal / red
-        # wick
-        ax.plot([x, x], [l, h], color=color, linewidth=0.8, zorder=2)
-        # body
+        col = "#26a69a" if c >= o else "#ef5350"
+        ax.plot([x, x], [l, h], color=col, linewidth=0.8, zorder=6)
         body_lo = min(o, c)
         body_hi = max(o, c)
         rect = mpatches.FancyBboxPatch(
             (x - w / 2, body_lo),
             w, max(body_hi - body_lo, (h - l) * 0.003),
             boxstyle="square,pad=0",
-            linewidth=0,
-            facecolor=color,
-            zorder=3,
+            linewidth=0, facecolor=col, zorder=7,
         )
         ax.add_patch(rect)
 
-    # ── EMA lines ────────────────────────────────
-    ax.plot(xs, df_c["EMA8"].values,  color="#00e5ff", linewidth=1.0, label="EMA 8",  zorder=4)
-    ax.plot(xs, df_c["EMA21"].values, color="#ffeb3b", linewidth=1.0, label="EMA 21", zorder=4)
-    ax.plot(xs, df_c["EMA50"].values, color="#ff9800", linewidth=1.2, label="EMA 50", zorder=4)
+    # ═══════════════════════════════════════════════
+    # LAYER 4 — EMA
+    # ═══════════════════════════════════════════════
+    ax.plot(xs, df_c["EMA8"].values,  color="#00e5ff", linewidth=1.0, label="EMA 8",  zorder=8)
+    ax.plot(xs, df_c["EMA21"].values, color="#ffeb3b", linewidth=1.0, label="EMA 21", zorder=8)
+    ax.plot(xs, df_c["EMA50"].values, color="#ff9800", linewidth=1.2, label="EMA 50", zorder=8)
 
-    # ── TP zone (hijau) ───────────────────────────
-    tp_mid   = (entry + tp) / 2
-    ax.axhspan(entry, tp, alpha=0.12, color="#00c853", zorder=1)
-    ax.axhline(tp,    color="#00e676", linewidth=1.4, linestyle="--", zorder=5)
-    ax.axhline(entry, color="#ffffff", linewidth=1.0, linestyle="--", zorder=5, alpha=0.7)
-    ax.text(
-        xs[-1] + 0.5, tp,
-        f" TP  {tp:.4f}",
-        color="#00e676", fontsize=8, va="center",
-        fontweight="bold",
-    )
+    # ═══════════════════════════════════════════════
+    # LAYER 5 — TP / Entry / SL lines + labels
+    # ═══════════════════════════════════════════════
+    lx = xs[-1] + 0.5   # x posisi label (kanan)
 
-    # ── SL zone (merah) ───────────────────────────
-    ax.axhspan(sl, entry, alpha=0.12, color="#d50000", zorder=1)
-    ax.axhline(sl, color="#ff1744", linewidth=1.4, linestyle="--", zorder=5)
-    ax.text(
-        xs[-1] + 0.5, sl,
-        f" SL  {sl:.4f}",
-        color="#ff1744", fontsize=8, va="center",
-        fontweight="bold",
-    )
-    ax.text(
-        xs[-1] + 0.5, entry,
-        f" Entry {entry:.4f}",
-        color="#ffffff", fontsize=8, va="center",
-        fontweight="bold", alpha=0.85,
-    )
+    # TP line
+    ax.axhline(tp, color="#00e676", linewidth=1.5, linestyle="--", zorder=9)
+    ax.text(lx, tp, f" 🎯 TP  {tp:.4f}", color="#00e676",
+            fontsize=8.5, va="center", fontweight="bold")
 
-    # ── x-axis tick labels (tanggal/jam) ──────────
-    tick_every = max(1, len(xs) // 10)
-    tick_idx   = xs[::tick_every]
-    tick_labels = [
-        df_c.index[i].strftime("%m/%d %H:%M") for i in tick_idx
-    ]
+    # Entry line
+    ax.axhline(entry, color="#ffffff", linewidth=1.0, linestyle="--", zorder=9, alpha=0.8)
+    ax.text(lx, entry, f" 📍 Entry  {entry:.4f}", color="#ffffff",
+            fontsize=8.5, va="center", fontweight="bold", alpha=0.9)
+
+    # SL line  (anti-sweep)
+    ax.axhline(sl, color="#ff1744", linewidth=1.5, linestyle="--", zorder=9)
+    ax.text(lx, sl, f" 🛡️ SL  {sl:.4f}\n   (anti-sweep)", color="#ff1744",
+            fontsize=8.5, va="center", fontweight="bold")
+
+    # ═══════════════════════════════════════════════
+    # LAYER 6 — RR bracket (panah di sisi kiri)
+    # ═══════════════════════════════════════════════
+    bx = -0.8   # x posisi bracket
+    # TP bracket
+    ax.annotate(
+        "", xy=(bx, tp), xytext=(bx, entry),
+        arrowprops=dict(arrowstyle="<->", color="#00e676", lw=1.2),
+    )
+    ax.text(bx - 0.3, (entry + tp) / 2, "TP",
+            color="#00e676", fontsize=7, ha="right", va="center")
+    # SL bracket
+    ax.annotate(
+        "", xy=(bx, sl), xytext=(bx, entry),
+        arrowprops=dict(arrowstyle="<->", color="#ff1744", lw=1.2),
+    )
+    ax.text(bx - 0.3, (entry + sl) / 2, "SL",
+            color="#ff1744", fontsize=7, ha="right", va="center")
+
+    # ═══════════════════════════════════════════════
+    # Axes formatting
+    # ═══════════════════════════════════════════════
+    tick_every  = max(1, len(xs) // 10)
+    tick_idx    = xs[::tick_every]
+    tick_labels = [df_c.index[i].strftime("%m/%d %H:%M") for i in tick_idx]
     ax.set_xticks(tick_idx)
     ax.set_xticklabels(tick_labels, rotation=30, ha="right", fontsize=7, color="#aaaaaa")
-    ax.set_xlim(-1, xs[-1] + 6)   # ruang label kanan
 
-    # ── y-axis ────────────────────────────────────
-    price_range = max(highs) - min(lows)
-    ax.set_ylim(min(lows) - price_range * 0.04, max(highs) + price_range * 0.04)
+    # y-range: cukupkan agar semua level (tp, sl, pool) terlihat
+    all_levels = [min(lows), max(highs), tp, sl]
+    if sweep_data:
+        all_levels += [sweep_data["buy_pool"], sweep_data["sell_pool"]]
+    y_lo = min(all_levels)
+    y_hi = max(all_levels)
+    pad  = (y_hi - y_lo) * 0.06
+    ax.set_ylim(y_lo - pad, y_hi + pad)
+    ax.set_xlim(-1.5, xs[-1] + 11)
+
     ax.yaxis.set_tick_params(labelcolor="#aaaaaa", labelsize=8)
     ax.yaxis.tick_right()
-
-    # ── grid ─────────────────────────────────────
     ax.grid(axis="y", color="#1f2937", linewidth=0.5, linestyle="-")
     ax.grid(axis="x", color="#1f2937", linewidth=0.3, linestyle=":")
-
-    # ── spines ───────────────────────────────────
     for spine in ax.spines.values():
         spine.set_edgecolor("#1f2937")
 
-    # ── legend & title ───────────────────────────
-    action_color = "#00e676" if entry < tp else "#ff1744"
-    action_label = "BUY" if entry < tp else "SELL"
-
+    # ═══════════════════════════════════════════════
+    # Legend (manual — lebih rapi)
+    # ═══════════════════════════════════════════════
+    legend_items = [
+        Line2D([0], [0], color="#00e5ff", lw=1.2, label="EMA 8"),
+        Line2D([0], [0], color="#ffeb3b", lw=1.2, label="EMA 21"),
+        Line2D([0], [0], color="#ff9800", lw=1.4, label="EMA 50"),
+        mpatches.Patch(facecolor="#00c853", alpha=0.4, label="TP Zone"),
+        mpatches.Patch(facecolor="#d50000", alpha=0.4, label="SL Zone"),
+    ]
+    if sweep_data:
+        legend_items += [
+            Line2D([0], [0], color="#ffd600", lw=1, linestyle=":", label="Buy-Side Pool"),
+            Line2D([0], [0], color="#ce93d8", lw=1, linestyle=":", label="Sell-Side Pool"),
+            Line2D([0], [0], color="#ff6d00", lw=1, linestyle="-.", label="Liq Sweep Ref"),
+            mpatches.Patch(facecolor="#b71c1c", alpha=0.5, label="Anti-Sweep Buffer"),
+        ]
     ax.legend(
-        loc="upper left", fontsize=8,
+        handles=legend_items, loc="upper left", fontsize=7.5,
         facecolor="#161b22", edgecolor="#30363d", labelcolor="#cccccc",
-    )
-    fig.suptitle(
-        f"{pair}  ·  {timeframe.upper()}  ·  {action_label}  @  {entry:.4f}",
-        color="#ffffff", fontsize=13, fontweight="bold", y=0.98,
+        ncol=2, framealpha=0.85,
     )
 
-    # ── watermark ────────────────────────────────
+    # ═══════════════════════════════════════════════
+    # Title
+    # ═══════════════════════════════════════════════
+    rr_val = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+    title_color = "#00e676" if is_buy else "#ff1744"
+    fig.suptitle(
+        f"{pair}  ·  {timeframe.upper()}  ·  {action_lbl}  @  {entry:.4f}"
+        f"   |   R:R  1:{rr_val:.2f}",
+        color=title_color, fontsize=13, fontweight="bold", y=0.97,
+    )
+
+    # ═══════════════════════════════════════════════
+    # Info bar bawah — ringkasan anti-sweep
+    # ═══════════════════════════════════════════════
+    if sweep_data:
+        sweep_txt = (
+            f"🛡️ Anti Liquidity Sweep SL  |  "
+            f"Pool ref: {sweep_data['sweep_ref']:.4f}  |  "
+            f"Buffer: {sweep_data['buf']:.4f}  |  "
+            f"SL beyond pool ({sweep_data['sweep_dir']} pool) → {sl:.4f}  |  "
+            f"RR 1:{rr_val:.2f}"
+        )
+    else:
+        sweep_txt = f"TP: {tp:.4f}  |  Entry: {entry:.4f}  |  SL: {sl:.4f}  |  RR 1:{rr_val:.2f}"
+
+    ax2.text(
+        0.5, 0.5, sweep_txt,
+        transform=ax2.transAxes,
+        color="#e0e0e0", fontsize=8.5, ha="center", va="center",
+        bbox=dict(facecolor="#161b22", edgecolor="#30363d", boxstyle="round,pad=0.4"),
+    )
+
+    # ═══════════════════════════════════════════════
+    # Watermark
+    # ═══════════════════════════════════════════════
     ax.text(
         0.5, 0.5, "AI INSTITUTIONAL BOT",
         transform=ax.transAxes,
-        fontsize=28, color="white", alpha=0.04,
+        fontsize=30, color="white", alpha=0.03,
         ha="center", va="center", rotation=30, fontweight="bold",
     )
 
     filename = f"{pair}_candles.png"
-    plt.tight_layout()
     plt.savefig(filename, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return filename
@@ -641,7 +871,7 @@ class TimeframeSelectView(View):
             view  = SignalActionView(data)
             if self.mode == "chart":
                 path = await run_blocking(
-                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"], tf
+                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"], tf, data["sweep"]
                 )
                 await channel.send(
                     f"📊 **{self.pair}** `{tf.upper()}` Candle Chart",
@@ -663,7 +893,7 @@ class SignalActionView(View):
         await interaction.response.defer()
         d    = self.data
         try:
-            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"], d["timeframe"])
+            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"], d["timeframe"], d["sweep"])
             await interaction.followup.send(
                 f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
                 file=discord.File(path),
@@ -771,7 +1001,7 @@ class TimeframeSelectMenu(View):
             return
 
         best  = max(results, key=lambda x: x["score"])
-        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"])
+        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"])
         embed = build_embed(best)
         view  = SignalActionView(best)
         await channel.send(embed=embed, view=view, file=discord.File(path))
@@ -791,7 +1021,7 @@ async def send_signal_or_chart(
 
         if mode == "chart":
             path = await run_blocking(
-                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"]
+                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"]
             )
             await interaction.followup.send(
                 f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
@@ -826,7 +1056,7 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
         return
 
     best = max(results, key=lambda x: x["score"])
-    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"])
+    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"])
     embed = build_embed(best)
     view  = SignalActionView(best)
     await interaction.followup.send(embed=embed, view=view, file=discord.File(path))
@@ -949,7 +1179,7 @@ async def auto_signal_loop():
                     try:
                         data = await run_blocking(generate_signal, pair, DEFAULT_TF)
                         if data["score"] >= AUTO_MIN_SCORE:
-                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"])
+                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"])
                             embed = build_embed(data)
                             view  = SignalActionView(data)
                             await channel.send(embed=embed, view=view, file=discord.File(path))
