@@ -11,8 +11,6 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 
-import mplfinance as mpf
-
 # ==================================================
 # ENV
 # ==================================================
@@ -425,43 +423,159 @@ def build_embed(data: dict) -> discord.Embed:
     return embed
 
 # ==================================================
-# CHART
+# CHART  — matplotlib candle chart dengan TP/SL zone
 # ==================================================
-def create_chart(df: pd.DataFrame, pair: str, entry: float, tp: float, sl: float) -> str:
-    df_chart = df.copy()
-    df_chart.index.name = "Date"
+def create_chart(
+    df: pd.DataFrame,
+    pair: str,
+    entry: float,
+    tp: float,
+    sl: float,
+    timeframe: str = DEFAULT_TF,
+) -> str:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import matplotlib.dates  as mdates
+    from matplotlib.patches import FancyArrowPatch
 
-    # pastikan index bertipe DatetimeIndex
-    if not isinstance(df_chart.index, pd.DatetimeIndex):
-        df_chart.index = pd.to_datetime(df_chart.index)
+    df_c = df.copy()
 
-    close = df_chart["Close"]
-    df_chart["EMA8"]  = ema(close, 8)
-    df_chart["EMA21"] = ema(close, 21)
-    df_chart["EMA50"] = ema(close, 50)
+    # ── pastikan DatetimeIndex ────────────────────
+    if not isinstance(df_c.index, pd.DatetimeIndex):
+        df_c.index = pd.to_datetime(df_c.index)
 
-    addplots = [
-        mpf.make_addplot(df_chart["EMA8"],  color="cyan",   width=1.0),
-        mpf.make_addplot(df_chart["EMA21"], color="yellow", width=1.0),
-        mpf.make_addplot(df_chart["EMA50"], color="orange", width=1.2),
-        mpf.make_addplot([entry] * len(df_chart), color="white",  linestyle="--", width=0.8),
-        mpf.make_addplot([tp]    * len(df_chart), color="lime",   linestyle="--", width=0.8),
-        mpf.make_addplot([sl]    * len(df_chart), color="red",    linestyle="--", width=0.8),
+    # ── trim ke jumlah candle yang wajar per TF ──
+    candle_limit = {
+        "5m":  100,
+        "15m": 100,
+        "1h":  96,
+        "4h":  60,
+    }
+    n = candle_limit.get(timeframe, 100)
+    df_c = df_c.iloc[-n:]
+
+    # ── hitung EMA ───────────────────────────────
+    close = df_c["Close"]
+    df_c["EMA8"]  = ema(close, 8)
+    df_c["EMA21"] = ema(close, 21)
+    df_c["EMA50"] = ema(close, 50)
+
+    # ── numeric x-axis ────────────────────────────
+    xs     = np.arange(len(df_c))
+    opens  = df_c["Open"].values
+    highs  = df_c["High"].values
+    lows   = df_c["Low"].values
+    closes = df_c["Close"].values
+
+    # ── figure setup ─────────────────────────────
+    fig, ax = plt.subplots(figsize=(16, 8))
+    fig.patch.set_facecolor("#0d1117")
+    ax.set_facecolor("#0d1117")
+
+    # candle width — lebih ramping jika banyak candle
+    w = 0.6
+
+    # ── draw candles ─────────────────────────────
+    for i, x in enumerate(xs):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        color = "#26a69a" if c >= o else "#ef5350"   # teal / red
+        # wick
+        ax.plot([x, x], [l, h], color=color, linewidth=0.8, zorder=2)
+        # body
+        body_lo = min(o, c)
+        body_hi = max(o, c)
+        rect = mpatches.FancyBboxPatch(
+            (x - w / 2, body_lo),
+            w, max(body_hi - body_lo, (h - l) * 0.003),
+            boxstyle="square,pad=0",
+            linewidth=0,
+            facecolor=color,
+            zorder=3,
+        )
+        ax.add_patch(rect)
+
+    # ── EMA lines ────────────────────────────────
+    ax.plot(xs, df_c["EMA8"].values,  color="#00e5ff", linewidth=1.0, label="EMA 8",  zorder=4)
+    ax.plot(xs, df_c["EMA21"].values, color="#ffeb3b", linewidth=1.0, label="EMA 21", zorder=4)
+    ax.plot(xs, df_c["EMA50"].values, color="#ff9800", linewidth=1.2, label="EMA 50", zorder=4)
+
+    # ── TP zone (hijau) ───────────────────────────
+    tp_mid   = (entry + tp) / 2
+    ax.axhspan(entry, tp, alpha=0.12, color="#00c853", zorder=1)
+    ax.axhline(tp,    color="#00e676", linewidth=1.4, linestyle="--", zorder=5)
+    ax.axhline(entry, color="#ffffff", linewidth=1.0, linestyle="--", zorder=5, alpha=0.7)
+    ax.text(
+        xs[-1] + 0.5, tp,
+        f" TP  {tp:.4f}",
+        color="#00e676", fontsize=8, va="center",
+        fontweight="bold",
+    )
+
+    # ── SL zone (merah) ───────────────────────────
+    ax.axhspan(sl, entry, alpha=0.12, color="#d50000", zorder=1)
+    ax.axhline(sl, color="#ff1744", linewidth=1.4, linestyle="--", zorder=5)
+    ax.text(
+        xs[-1] + 0.5, sl,
+        f" SL  {sl:.4f}",
+        color="#ff1744", fontsize=8, va="center",
+        fontweight="bold",
+    )
+    ax.text(
+        xs[-1] + 0.5, entry,
+        f" Entry {entry:.4f}",
+        color="#ffffff", fontsize=8, va="center",
+        fontweight="bold", alpha=0.85,
+    )
+
+    # ── x-axis tick labels (tanggal/jam) ──────────
+    tick_every = max(1, len(xs) // 10)
+    tick_idx   = xs[::tick_every]
+    tick_labels = [
+        df_c.index[i].strftime("%m/%d %H:%M") for i in tick_idx
     ]
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_labels, rotation=30, ha="right", fontsize=7, color="#aaaaaa")
+    ax.set_xlim(-1, xs[-1] + 6)   # ruang label kanan
+
+    # ── y-axis ────────────────────────────────────
+    price_range = max(highs) - min(lows)
+    ax.set_ylim(min(lows) - price_range * 0.04, max(highs) + price_range * 0.04)
+    ax.yaxis.set_tick_params(labelcolor="#aaaaaa", labelsize=8)
+    ax.yaxis.tick_right()
+
+    # ── grid ─────────────────────────────────────
+    ax.grid(axis="y", color="#1f2937", linewidth=0.5, linestyle="-")
+    ax.grid(axis="x", color="#1f2937", linewidth=0.3, linestyle=":")
+
+    # ── spines ───────────────────────────────────
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#1f2937")
+
+    # ── legend & title ───────────────────────────
+    action_color = "#00e676" if entry < tp else "#ff1744"
+    action_label = "BUY" if entry < tp else "SELL"
+
+    ax.legend(
+        loc="upper left", fontsize=8,
+        facecolor="#161b22", edgecolor="#30363d", labelcolor="#cccccc",
+    )
+    fig.suptitle(
+        f"{pair}  ·  {timeframe.upper()}  ·  {action_label}  @  {entry:.4f}",
+        color="#ffffff", fontsize=13, fontweight="bold", y=0.98,
+    )
+
+    # ── watermark ────────────────────────────────
+    ax.text(
+        0.5, 0.5, "AI INSTITUTIONAL BOT",
+        transform=ax.transAxes,
+        fontsize=28, color="white", alpha=0.04,
+        ha="center", va="center", rotation=30, fontweight="bold",
+    )
 
     filename = f"{pair}_candles.png"
-
-    # volume=True tidak valid di versi mplfinance terbaru — selalu False
-    # volume panel di-skip untuk menghindari validator error
-    mpf.plot(
-        df_chart,
-        type    = "candle",
-        style   = "charles",
-        volume  = False,
-        title   = f"{pair} Signal Chart",
-        addplot = addplots,
-        savefig = dict(fname=filename, dpi=150, bbox_inches="tight"),
-    )
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
     return filename
 
 # ==================================================
@@ -527,7 +641,7 @@ class TimeframeSelectView(View):
             view  = SignalActionView(data)
             if self.mode == "chart":
                 path = await run_blocking(
-                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"]
+                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"], tf
                 )
                 await channel.send(
                     f"📊 **{self.pair}** `{tf.upper()}` Candle Chart",
@@ -549,7 +663,7 @@ class SignalActionView(View):
         await interaction.response.defer()
         d    = self.data
         try:
-            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"])
+            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"], d["timeframe"])
             await interaction.followup.send(
                 f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
                 file=discord.File(path),
@@ -657,7 +771,7 @@ class TimeframeSelectMenu(View):
             return
 
         best  = max(results, key=lambda x: x["score"])
-        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
+        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"])
         embed = build_embed(best)
         view  = SignalActionView(best)
         await channel.send(embed=embed, view=view, file=discord.File(path))
@@ -677,7 +791,7 @@ async def send_signal_or_chart(
 
         if mode == "chart":
             path = await run_blocking(
-                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"]
+                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"]
             )
             await interaction.followup.send(
                 f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
@@ -712,7 +826,7 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
         return
 
     best = max(results, key=lambda x: x["score"])
-    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"])
+    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"])
     embed = build_embed(best)
     view  = SignalActionView(best)
     await interaction.followup.send(embed=embed, view=view, file=discord.File(path))
@@ -835,7 +949,7 @@ async def auto_signal_loop():
                     try:
                         data = await run_blocking(generate_signal, pair, DEFAULT_TF)
                         if data["score"] >= AUTO_MIN_SCORE:
-                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"])
+                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"])
                             embed = build_embed(data)
                             view  = SignalActionView(data)
                             await channel.send(embed=embed, view=view, file=discord.File(path))
