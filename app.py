@@ -665,7 +665,7 @@ async def menu(interaction: discord.Interaction):
     embed.add_field(name="📈 Signal per Pair",   value="Sinyal spesifik untuk satu pair",         inline=False)
     embed.add_field(name="📊 Chart per Pair",    value="Candle chart tanpa sinyal",                inline=False)
     embed.add_field(name="🔁 Scan Semua Pair",   value="Ringkasan cepat semua pair",              inline=False)
-    embed.add_field(name="⚙️ Auto Signal Toggle","Aktifkan/matikan auto-signal otomatis",         inline=False)
+    embed.add_field(name="⚙️ Auto Signal Toggle", value="Aktifkan/matikan auto-signal otomatis",  inline=False)
     await interaction.response.send_message(embed=embed, view=MainMenuView())
 
 @client.tree.command(name="signal", description="Best AI signal dari semua pair")
