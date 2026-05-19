@@ -913,7 +913,7 @@ def build_embed(data: dict) -> discord.Embed:
     )
 
     embed.set_footer(
-        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | AI Institutional Engine v3"
+        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | AI Engine v3 by Yor"
     )
     return embed
 
