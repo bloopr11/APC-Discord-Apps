@@ -122,14 +122,11 @@ def stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
     return stoch_k, stoch_d
 
 def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0):
-    sma    = series.rolling(period).mean()
-    std    = series.rolling(period).std()
-    upper  = sma + std_dev * std
-    lower  = sma - std_dev * std
-    return upper, sma, lower
+    sma   = series.rolling(period).mean()
+    std   = series.rolling(period).std()
+    return sma + std_dev * std, sma, sma - std_dev * std
 
 def volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
-    """Current volume vs rolling average — >1 means above-average activity."""
     if "Volume" not in df.columns or df["Volume"].sum() == 0:
         return 1.0
     avg_vol = df["Volume"].rolling(period).mean().iloc[-1]
@@ -137,21 +134,294 @@ def volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
     return float(cur_vol / avg_vol) if avg_vol else 1.0
 
 # ==================================================
+# ① DELTA VOLUME PROXY  (real orderflow approximation)
+# ==================================================
+def delta_orderflow(df: pd.DataFrame, period: int = 20) -> dict:
+    """
+    Delta = bullish_volume - bearish_volume per candle.
+    Bullish candle  → volume counts as buying pressure (+)
+    Bearish candle  → volume counts as selling pressure (-)
+
+    Cumulative delta trend tells us who is in control.
+    CVD slope (last N bars) = orderflow bias direction.
+    """
+    if "Volume" not in df.columns or df["Volume"].sum() == 0:
+        return {
+            "delta":        0.0,
+            "cvd_slope":    0.0,
+            "bias":         "NEUTRAL",
+            "buy_vol_pct":  50.0,
+            "absorption":   False,
+        }
+
+    close  = df["Close"]
+    open_  = df["Open"]
+    vol    = df["Volume"]
+
+    # signed delta per candle
+    direction     = np.where(close >= open_, 1.0, -1.0)
+    signed_vol    = vol * direction
+
+    # cumulative volume delta
+    cvd           = signed_vol.cumsum()
+
+    # slope of CVD over last `period` bars → trend of orderflow
+    cvd_tail      = cvd.iloc[-period:]
+    x             = np.arange(len(cvd_tail))
+    if len(x) > 1:
+        slope = float(np.polyfit(x, cvd_tail.values, 1)[0])
+    else:
+        slope = 0.0
+
+    # last bar delta
+    last_delta    = float(signed_vol.iloc[-1])
+
+    # buy volume % of total (last period)
+    buy_vol       = vol[direction == 1.0].iloc[-period:].sum()
+    total_vol     = vol.iloc[-period:].sum()
+    buy_pct       = float(buy_vol / total_vol * 100) if total_vol > 0 else 50.0
+
+    # absorption: price barely moved but high volume → smart money absorbing
+    price_range   = float((close - open_).abs().iloc[-3:].mean())
+    vol_mean      = float(vol.rolling(20).mean().iloc[-1]) or 1
+    absorption    = (float(vol.iloc[-1]) > 1.5 * vol_mean) and (price_range < float(atr(df).iloc[-1]) * 0.3)
+
+    bias = "BUY" if slope > 0 else "SELL" if slope < 0 else "NEUTRAL"
+
+    return {
+        "delta":       last_delta,
+        "cvd_slope":   slope,
+        "bias":        bias,
+        "buy_vol_pct": buy_pct,
+        "absorption":  absorption,
+        "cvd":         cvd,           # full series for chart
+    }
+
+# ==================================================
+# ② FVG ENGINE  (Fair Value Gap / Imbalance)
+# ==================================================
+def fvg_engine(df: pd.DataFrame, lookback: int = 50) -> dict:
+    """
+    Bullish FVG: candle[i-2].high < candle[i].low  → gap that price may fill
+    Bearish FVG: candle[i-2].low  > candle[i].high → gap that price may fill
+
+    Returns list of active FVGs (not yet filled) and whether price is
+    currently inside one (high-probability zone).
+    """
+    highs  = df["High"].values
+    lows   = df["Low"].values
+    closes = df["Close"].values
+    n      = len(df)
+
+    bull_fvgs = []   # (top, bottom, bar_idx)
+    bear_fvgs = []
+
+    start = max(2, n - lookback)
+    for i in range(start, n - 1):
+        # Bullish FVG
+        if lows[i] > highs[i - 2]:
+            top    = lows[i]
+            bottom = highs[i - 2]
+            # check if still unfilled (current price hasn't closed inside gap)
+            if closes[-1] > bottom:
+                bull_fvgs.append({"top": top, "bottom": bottom, "idx": i})
+
+        # Bearish FVG
+        if highs[i] < lows[i - 2]:
+            top    = lows[i - 2]
+            bottom = highs[i]
+            if closes[-1] < top:
+                bear_fvgs.append({"top": top, "bottom": bottom, "idx": i})
+
+    price = closes[-1]
+
+    # Is price inside a bullish FVG? → high-probability BUY zone
+    in_bull_fvg = any(f["bottom"] <= price <= f["top"] for f in bull_fvgs)
+    # Is price inside a bearish FVG? → high-probability SELL zone
+    in_bear_fvg = any(f["bottom"] <= price <= f["top"] for f in bear_fvgs)
+
+    # Nearest FVG levels (for chart)
+    nearest_bull = bull_fvgs[-1] if bull_fvgs else None
+    nearest_bear = bear_fvgs[-1] if bear_fvgs else None
+
+    return {
+        "bull_fvgs":    bull_fvgs,
+        "bear_fvgs":    bear_fvgs,
+        "in_bull_fvg":  in_bull_fvg,
+        "in_bear_fvg":  in_bear_fvg,
+        "nearest_bull": nearest_bull,
+        "nearest_bear": nearest_bear,
+        "count_bull":   len(bull_fvgs),
+        "count_bear":   len(bear_fvgs),
+    }
+
+# ==================================================
+# ③ MTF BIAS  (Multi-Timeframe Confluence)
+# ==================================================
+MTF_MAP = {
+    "5m":  ["1h",  "4h"],
+    "15m": ["1h",  "4h"],
+    "1h":  ["4h",  "1d"],
+    "4h":  ["1d",  "1wk"],
+}
+
+MTF_FETCH = {
+    "1h":  {"period": "30d",  "interval": "1h"},
+    "4h":  {"period": "60d",  "interval": "4h"},
+    "1d":  {"period": "180d", "interval": "1d"},
+    "1wk": {"period": "730d", "interval": "1wk"},
+}
+
+def _get_htf_data(symbol: str, tf: str) -> pd.DataFrame:
+    cfg = MTF_FETCH.get(tf, {"period": "30d", "interval": "1h"})
+    df  = yf.download(symbol, period=cfg["period"], interval=cfg["interval"],
+                      auto_adjust=True, progress=False)
+    df  = df.dropna()
+    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+    return df
+
+def mtf_bias(symbol: str, base_tf: str) -> dict:
+    """
+    Fetch 2 higher timeframes and compute bias for each.
+    Bias per TF = weighted sum of:
+      - EMA stack (8/21/50 alignment)
+      - RSI position (>55 bull, <45 bear)
+      - MACD histogram sign
+      - Price vs 200 EMA
+    Returns combined bias score (-100 to +100) and per-TF detail.
+    """
+    htf_list = MTF_MAP.get(base_tf, ["1h", "4h"])
+    results  = {}
+    total_score = 0
+    weights     = [0.6, 0.4]   # closer TF has more weight
+
+    for tf, w in zip(htf_list, weights):
+        try:
+            df_h   = _get_htf_data(symbol, tf)
+            close  = df_h["Close"]
+            price  = float(close.iloc[-1])
+
+            e8     = float(ema(close, 8).iloc[-1])
+            e21    = float(ema(close, 21).iloc[-1])
+            e50    = float(ema(close, 50).iloc[-1])
+            e200   = float(ema(close, 200).iloc[-1])
+            rsi_v  = float(rsi(close).iloc[-1])
+            _, _, mh = macd(close)
+            macd_v = float(mh.iloc[-1])
+
+            s = 0
+            # EMA stack
+            if price > e8 > e21 > e50:   s += 40
+            elif price < e8 < e21 < e50: s -= 40
+            elif price > e21:            s += 20
+            elif price < e21:            s -= 20
+
+            # Price vs 200 EMA
+            if price > e200:  s += 20
+            else:             s -= 20
+
+            # RSI
+            if rsi_v > 55:   s += 20
+            elif rsi_v < 45: s -= 20
+
+            # MACD hist
+            if macd_v > 0:   s += 20
+            else:             s -= 20
+
+            bias_lbl = "BULLISH" if s > 20 else "BEARISH" if s < -20 else "NEUTRAL"
+            results[tf] = {
+                "score": s, "bias": bias_lbl,
+                "rsi": rsi_v, "price": price,
+                "e50": e50, "e200": e200,
+            }
+            total_score += s * w
+
+        except Exception as ex:
+            results[tf] = {"score": 0, "bias": "NEUTRAL", "error": str(ex)}
+
+    combined_bias = "BULLISH" if total_score > 15 else "BEARISH" if total_score < -15 else "NEUTRAL"
+    return {
+        "score":    total_score,
+        "bias":     combined_bias,
+        "detail":   results,
+        "htf_list": htf_list,
+    }
+
+# ==================================================
+# ④ SESSION FILTER
+# ==================================================
+import datetime as dt
+
+SESSIONS = {
+    "ASIA":   {"start": dt.time(0,  0), "end": dt.time(8,  59), "color": "#7986cb"},
+    "LONDON": {"start": dt.time(7,  0), "end": dt.time(15, 59), "color": "#4db6ac"},
+    "NEW_YORK":{"start": dt.time(12, 0), "end": dt.time(20, 59), "color": "#ff8a65"},
+    "OVERLAP": {"start": dt.time(12, 0), "end": dt.time(15, 59), "color": "#fff176"},
+}
+
+# Score bonus / penalty per session (volatility & liquidity weight)
+SESSION_SCORE = {
+    "OVERLAP":  15,   # London + NY overlap — highest liquidity
+    "LONDON":   10,
+    "NEW_YORK":  8,
+    "ASIA":      0,   # low volatility for most pairs
+    "OFF":      -10,  # outside all sessions
+}
+
+# Pairs that are active in ASIA session
+ASIA_ACTIVE = {"BTCUSD", "ETHUSD", "BNBUSD", "ADAUSD", "XRPUSD",
+               "SOLUSD", "DOGEUSD", "AVAXUSD", "LINKUSD"}
+
+def session_filter(pair: str) -> dict:
+    """Return current session, score modifier, and whether to trade."""
+    now_utc  = dt.datetime.utcnow().time()
+    active   = []
+
+    for name, cfg in SESSIONS.items():
+        s, e = cfg["start"], cfg["end"]
+        if s <= now_utc <= e:
+            active.append(name)
+
+    # determine dominant session
+    if "OVERLAP" in active:
+        session = "OVERLAP"
+    elif "LONDON" in active and "NEW_YORK" not in active:
+        session = "LONDON"
+    elif "NEW_YORK" in active and "LONDON" not in active:
+        session = "NEW_YORK"
+    elif "ASIA" in active:
+        session = "ASIA"
+    else:
+        session = "OFF"
+
+    score_mod = SESSION_SCORE.get(session, 0)
+
+    # XAUUSD is best traded London/NY/Overlap only
+    if pair == "XAUUSD" and session in ("ASIA", "OFF"):
+        score_mod -= 15
+
+    # Crypto pairs are 24/7 — no penalty for ASIA
+    if pair in ASIA_ACTIVE and session == "ASIA":
+        score_mod = max(score_mod, 0)
+
+    tradeable = session not in ("OFF",) or pair in ASIA_ACTIVE
+
+    return {
+        "session":   session,
+        "score_mod": score_mod,
+        "tradeable": tradeable,
+        "utc_time":  dt.datetime.utcnow().strftime("%H:%M UTC"),
+    }
+
+# ==================================================
 # RSI DIVERGENCE
 # ==================================================
 def rsi_divergence(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) -> str:
-    """
-    Bullish divergence  : price lower low, RSI higher low  → potential reversal up
-    Bearish divergence  : price higher high, RSI lower high → potential reversal down
-    """
-    close = df["Close"]
+    close      = df["Close"]
     price_diff = close.iloc[-1] - close.iloc[-lookback]
     rsi_diff   = rsi_series.iloc[-1] - rsi_series.iloc[-lookback]
-
-    if price_diff < 0 and rsi_diff > 0:
-        return "BULLISH_DIV"
-    if price_diff > 0 and rsi_diff < 0:
-        return "BEARISH_DIV"
+    if price_diff < 0 and rsi_diff > 0: return "BULLISH_DIV"
+    if price_diff > 0 and rsi_diff < 0: return "BEARISH_DIV"
     return "NONE"
 
 # ==================================================
@@ -164,53 +434,36 @@ def ema_confluence(df: pd.DataFrame):
     e50   = ema(close, 50).iloc[-1]
     e200  = ema(close, 200).iloc[-1]
     price = close.iloc[-1]
-
-    bullish = price > e8 > e21 > e50    # stacked bull
-    bearish = price < e8 < e21 < e50    # stacked bear
-    near_200 = abs(price - e200) / e200 < 0.005   # within 0.5% of 200 EMA
-
     return {
-        "BULLISH_STACK": bullish,
-        "BEARISH_STACK": bearish,
-        "NEAR_200EMA":   near_200,
+        "BULLISH_STACK": bool(price > e8 > e21 > e50),
+        "BEARISH_STACK": bool(price < e8 < e21 < e50),
+        "NEAR_200EMA":   bool(abs(price - e200) / e200 < 0.005),
         "E8": e8, "E21": e21, "E50": e50, "E200": e200,
     }
 
 # ==================================================
-# SMC ENGINE (improved)
+# SMC ENGINE
 # ==================================================
 def smc(df: pd.DataFrame) -> dict:
     close, high, low = df["Close"], df["High"], df["Low"]
-
-    swing_high  = high.rolling(10).max()
-    swing_low   = low.rolling(10).min()
-
-    bos    = close.iloc[-1] > swing_high.iloc[-2]
-    choch  = close.iloc[-1] < swing_low.iloc[-2]
-    liq    = high.iloc[-1]  > high.rolling(20).max().iloc[-2]
-
-    # Order block: last big bearish/bullish candle before a BOS
+    swing_high = high.rolling(10).max()
+    swing_low  = low.rolling(10).min()
     body       = (close - df["Open"]).abs()
-    big_candle = body.iloc[-3] > body.rolling(10).mean().iloc[-3]
-
     return {
-        "BOS":        bool(bos),
-        "CHoCH":      bool(choch),
-        "LIQ":        bool(liq),
-        "ORDER_BLOCK": bool(big_candle),
+        "BOS":         bool(close.iloc[-1] > swing_high.iloc[-2]),
+        "CHoCH":       bool(close.iloc[-1] < swing_low.iloc[-2]),
+        "LIQ":         bool(high.iloc[-1] > high.rolling(20).max().iloc[-2]),
+        "ORDER_BLOCK": bool(body.iloc[-3] > body.rolling(10).mean().iloc[-3]),
     }
 
 # ==================================================
 # LIQUIDITY ENGINE
 # ==================================================
 def liquidity(df: pd.DataFrame) -> dict:
-    high_zone     = df["High"].rolling(20).max().iloc[-1]
-    low_zone      = df["Low"].rolling(20).min().iloc[-1]
-    current_price = df["Close"].iloc[-1]
-    pressure      = (
-        "BUY" if abs(current_price - low_zone) < abs(current_price - high_zone)
-        else "SELL"
-    )
+    high_zone  = df["High"].rolling(20).max().iloc[-1]
+    low_zone   = df["Low"].rolling(20).min().iloc[-1]
+    price      = df["Close"].iloc[-1]
+    pressure   = "BUY" if abs(price - low_zone) < abs(price - high_zone) else "SELL"
     return {"HIGH_ZONE": high_zone, "LOW_ZONE": low_zone, "PRESSURE": pressure}
 
 # ==================================================
@@ -218,118 +471,197 @@ def liquidity(df: pd.DataFrame) -> dict:
 # ==================================================
 def flow(df: pd.DataFrame) -> dict:
     momentum = df["Close"].diff().mean()
+    return {"FLOW": "BUY" if momentum > 0 else "SELL", "STRENGTH": abs(momentum) * 100}
+
+# ==================================================
+# TREND STRENGTH  (ADX proxy)
+# ==================================================
+def trend_strength(df: pd.DataFrame, period: int = 14) -> dict:
+    """
+    Simplified ADX-like strength using directional movement.
+    +DM / -DM ratio → trend conviction score 0-100
+    """
+    high  = df["High"]
+    low   = df["Low"]
+    close = df["Close"]
+
+    up_move   = high.diff()
+    down_move = -low.diff()
+
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    atr_s    = atr(df, period)
+    plus_di  = pd.Series(plus_dm,  index=df.index).rolling(period).mean() / atr_s * 100
+    minus_di = pd.Series(minus_dm, index=df.index).rolling(period).mean() / atr_s * 100
+
+    dx       = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100)
+    adx      = dx.rolling(period).mean()
+
+    adx_val  = float(adx.iloc[-1]) if not np.isnan(adx.iloc[-1]) else 20.0
+    pdi      = float(plus_di.iloc[-1])  if not np.isnan(plus_di.iloc[-1])  else 25.0
+    mdi      = float(minus_di.iloc[-1]) if not np.isnan(minus_di.iloc[-1]) else 25.0
+
+    trending = adx_val > 25
+    bull_trend = pdi > mdi
+
     return {
-        "FLOW":     "BUY" if momentum > 0 else "SELL",
-        "STRENGTH": abs(momentum) * 100,
+        "adx":        adx_val,
+        "plus_di":    pdi,
+        "minus_di":   mdi,
+        "trending":   trending,
+        "bull_trend": bull_trend,
     }
 
 # ==================================================
-# LSTM PROXY (improved: multi-EMA weighted bias)
+# LSTM PROXY (multi-EMA weighted bias)
 # ==================================================
 def lstm_prediction(df: pd.DataFrame) -> str:
-    close   = df["Close"]
-    price   = close.iloc[-1]
-    ema20   = ema(close, 20).iloc[-1]
-    ema50   = ema(close, 50).iloc[-1]
-    ema200  = ema(close, 200).iloc[-1]
-    score   = sum([price > ema20, price > ema50, price > ema200])
+    close  = df["Close"]
+    price  = close.iloc[-1]
+    score  = sum([
+        price > ema(close, 20).iloc[-1],
+        price > ema(close, 50).iloc[-1],
+        price > ema(close, 200).iloc[-1],
+    ])
     return "BULLISH" if score >= 2 else "BEARISH"
 
 # ==================================================
-# IMPROVED AI SCORE  (max 100)
+# ⑤ ADVANCED RULE-BASED SCORING  (replaces ai_score)
 # ==================================================
-def ai_score(lstm, smc_data, liq, fl, rsi_val, macd_hist, ema_conf,
-             rsi_div, vol_ratio, stoch_k_val, bb_pos) -> int:
-    score = 50
+def advanced_score(
+    lstm, smc_data, liq, fl, rsi_val, macd_hist, ema_conf,
+    rsi_div, vol_ratio, stoch_k_val, bb_pos,
+    # new engines
+    of: dict,       # orderflow delta
+    fvg: dict,      # fair value gap
+    mtf: dict,      # multi-timeframe bias
+    sess: dict,     # session filter
+    trend: dict,    # trend strength
+) -> dict:
+    """
+    Scores 0-100 with per-category breakdown for transparency.
+    Returns dict with total score and sub-scores.
+    """
+    cats = {}   # category breakdown
 
-    # ── LSTM (multi-EMA) ──────────────────────────
-    score += 15 if lstm == "BULLISH" else -15
+    # ── 1. TREND STRUCTURE (max 25) ───────────────
+    t = 0
+    if lstm == "BULLISH":           t += 10
+    else:                           t -= 10
+    if ema_conf["BULLISH_STACK"]:   t += 8
+    elif ema_conf["BEARISH_STACK"]: t -= 8
+    if ema_conf["NEAR_200EMA"]:     t += 3
+    if trend["trending"]:
+        t += 4 if trend["bull_trend"] else -4
+    cats["TREND"] = max(-25, min(25, t))
 
-    # ── SMC ──────────────────────────────────────
-    if smc_data["BOS"]:         score += 8
-    if smc_data["LIQ"]:         score += 6
-    if smc_data["ORDER_BLOCK"]: score += 5
-    if smc_data["CHoCH"]:       score -= 10
+    # ── 2. MOMENTUM (max 20) ──────────────────────
+    m = 0
+    if rsi_val < 30:         m += 10
+    elif rsi_val > 70:       m -= 10
+    elif rsi_val > 55:       m += 4
+    elif rsi_val < 45:       m -= 4
+    if rsi_div == "BULLISH_DIV":  m += 6
+    elif rsi_div == "BEARISH_DIV": m -= 6
+    if macd_hist > 0:        m += 4
+    else:                    m -= 4
+    if stoch_k_val < 20:     m += 4
+    elif stoch_k_val > 80:   m -= 4
+    cats["MOMENTUM"] = max(-20, min(20, m))
 
-    # ── Liquidity pressure ────────────────────────
-    score += 8 if liq["PRESSURE"] == "BUY" else -8
+    # ── 3. SMC / STRUCTURE (max 20) ───────────────
+    s = 0
+    if smc_data["BOS"]:          s += 8
+    if smc_data["LIQ"]:          s += 5
+    if smc_data["ORDER_BLOCK"]:  s += 5
+    if smc_data["CHoCH"]:        s -= 10
+    if liq["PRESSURE"] == "BUY": s += 5
+    else:                         s -= 5
+    if fl["FLOW"] == "BUY":      s += 3
+    else:                         s -= 3
+    cats["SMC"] = max(-20, min(20, s))
 
-    # ── Flow ─────────────────────────────────────
-    score += 5 if fl["FLOW"] == "BUY" else -5
+    # ── 4. ORDERFLOW DELTA (max 15) ───────────────
+    o = 0
+    if of["bias"] == "BUY":      o += 8
+    elif of["bias"] == "SELL":   o -= 8
+    if of["buy_vol_pct"] > 60:   o += 4
+    elif of["buy_vol_pct"] < 40: o -= 4
+    if of["absorption"]:         o += 3   # smart money absorbing → reversal signal
+    if vol_ratio >= 1.5:         o += 3
+    elif vol_ratio < 0.7:        o -= 3
+    cats["ORDERFLOW"] = max(-15, min(15, o))
 
-    # ── RSI ──────────────────────────────────────
-    if rsi_val < 30:   score += 10   # oversold → bullish edge
-    elif rsi_val > 70: score -= 10   # overbought → bearish edge
-    elif 45 <= rsi_val <= 55:
-        score += 0                   # neutral zone
-    elif rsi_val > 55: score += 4
-    else:              score -= 4
+    # ── 5. FVG / IMBALANCE (max 10) ───────────────
+    f = 0
+    if fvg["in_bull_fvg"]:       f += 10   # price in bullish FVG → strong BUY zone
+    elif fvg["in_bear_fvg"]:     f -= 10
+    elif fvg["count_bull"] > 0:  f += 3    # nearby bull FVGs
+    elif fvg["count_bear"] > 0:  f -= 3
+    cats["FVG"] = max(-10, min(10, f))
 
-    # ── RSI Divergence ────────────────────────────
-    if rsi_div == "BULLISH_DIV":  score += 8
-    elif rsi_div == "BEARISH_DIV": score -= 8
+    # ── 6. MTF BIAS (max 15) ──────────────────────
+    mtf_s = 0
+    if mtf["bias"] == "BULLISH":   mtf_s += 15
+    elif mtf["bias"] == "BEARISH": mtf_s -= 15
+    else:                           mtf_s += 0
+    cats["MTF"] = max(-15, min(15, mtf_s))
 
-    # ── MACD Histogram ────────────────────────────
-    if macd_hist > 0:  score += 6
-    else:              score -= 6
+    # ── 7. SESSION (max 10) ───────────────────────
+    cats["SESSION"] = max(-10, min(10, sess["score_mod"]))
 
-    # ── EMA Confluence ───────────────────────────
-    if ema_conf["BULLISH_STACK"]:  score += 10
-    if ema_conf["BEARISH_STACK"]:  score -= 10
-    if ema_conf["NEAR_200EMA"]:    score += 3   # 200 EMA magnet
+    # ── 8. BOLLINGER BAND (max 5) ─────────────────
+    b = 0
+    if bb_pos < 0.15:   b += 5
+    elif bb_pos > 0.85: b -= 5
+    cats["BB"] = b
 
-    # ── Volume ───────────────────────────────────
-    if vol_ratio >= 1.5:   score += 5   # high volume confirms move
-    elif vol_ratio < 0.7:  score -= 3   # weak volume → less reliable
+    # ── TOTAL (baseline 50, add cats) ─────────────
+    total = 50 + sum(cats.values())
+    total = max(0, min(100, total))
 
-    # ── Stochastic ───────────────────────────────
-    if stoch_k_val < 20:   score += 5
-    elif stoch_k_val > 80: score -= 5
+    # ── CONFLUENCE COUNT ──────────────────────────
+    # how many categories agree with the direction
+    direction = "BUY" if total >= 55 else "SELL"
+    agree = sum([
+        cats["TREND"]     > 0 if direction == "BUY" else cats["TREND"]     < 0,
+        cats["MOMENTUM"]  > 0 if direction == "BUY" else cats["MOMENTUM"]  < 0,
+        cats["SMC"]       > 0 if direction == "BUY" else cats["SMC"]       < 0,
+        cats["ORDERFLOW"] > 0 if direction == "BUY" else cats["ORDERFLOW"] < 0,
+        cats["FVG"]       > 0 if direction == "BUY" else cats["FVG"]       < 0,
+        cats["MTF"]       > 0 if direction == "BUY" else cats["MTF"]       < 0,
+    ])
 
-    # ── Bollinger Band position ───────────────────
-    # bb_pos: 0 = at lower, 1 = at upper
-    if bb_pos < 0.15:      score += 4   # near lower band
-    elif bb_pos > 0.85:    score -= 4   # near upper band
-
-    return max(0, min(100, score))
+    return {
+        "total":       total,
+        "cats":        cats,
+        "confluence":  agree,   # out of 6
+    }
 
 # ==================================================
 # CONFIDENCE LABEL
 # ==================================================
-def confidence_label(score: int) -> str:
-    if score >= 80: return "🔥 VERY HIGH"
-    if score >= 65: return "✅ HIGH"
-    if score >= 50: return "⚠️ MODERATE"
+def confidence_label(score: int, confluence: int = 0) -> str:
+    if score >= 82 and confluence >= 5: return "🔥 VERY HIGH"
+    if score >= 70 and confluence >= 4: return "✅ HIGH"
+    if score >= 55:                      return "⚠️ MODERATE"
     return "❌ LOW"
 
 # ==================================================
-# LIQUIDITY POOL ZONES  (swing highs / swing lows)
+# LIQUIDITY POOL ZONES
 # ==================================================
-def liquidity_pools(df: pd.DataFrame, swing: int = 20):
-    """
-    Kembalikan zona likuiditas utama:
-    - buy_side_liq  : kumpulan stop-loss BUY yang tersimpan di bawah swing low
-                      (target stop-hunt oleh market maker saat harga turun)
-    - sell_side_liq : kumpulan stop-loss SELL yang tersimpan di atas swing high
-                      (target stop-hunt saat harga naik)
-    Masing-masing berupa (level_harga, buffer_bawah, buffer_atas)
-    """
-    high = df["High"]
-    low  = df["Low"]
+def liquidity_pools(df: pd.DataFrame, swing: int = 20) -> dict:
+    high    = df["High"]
+    low     = df["Low"]
     atr_now = float(df["High"].rolling(14).mean().iloc[-1] -
                     df["Low"].rolling(14).mean().iloc[-1])
-
-    # Swing low = titik terendah dalam window → di sinilah SL retail BUY menumpuk
     swing_low  = float(low.rolling(swing).min().iloc[-1])
-    # Swing high = titik tertinggi → di sinilah SL retail SELL menumpuk
     swing_high = float(high.rolling(swing).max().iloc[-1])
-
-    # Buffer kecil di luar pool agar SL kita melewati zona sweep
     buf = atr_now * 0.3
-
     return {
-        "buy_side_liq":  swing_low,   # pool SL di bawah → rawan di-sweep ke bawah
-        "sell_side_liq": swing_high,  # pool SL di atas  → rawan di-sweep ke atas
+        "buy_side_liq":  swing_low,
+        "sell_side_liq": swing_high,
         "buf":           buf,
         "swing":         swing,
     }
@@ -337,104 +669,91 @@ def liquidity_pools(df: pd.DataFrame, swing: int = 20):
 # ==================================================
 # ANTI-LIQUIDITY-SWEEP TP / SL
 # ==================================================
-def tp_sl_anti_sweep(df: pd.DataFrame, action: str, atr_val: float):
-    """
-    SL ditempatkan BEYOND liquidity pool, bukan di dalam pool.
-    Artinya SL kita sudah di luar zona di mana market maker biasanya
-    melakukan stop-hunt, sehingga tidak mudah tersapu (sweep).
-
-    BUY  → SL di bawah swing_low - buffer  (melewati pool SL retail)
-    SELL → SL di atas  swing_high + buffer  (melewati pool SL retail)
-
-    TP menggunakan 2.5× jarak SL dari entry agar RR minimal 1:2.5
-    """
-    price  = float(df["Close"].iloc[-1])
-    pools  = liquidity_pools(df)
-
+def tp_sl_anti_sweep(df: pd.DataFrame, action: str, atr_val: float) -> dict:
+    price = float(df["Close"].iloc[-1])
+    pools = liquidity_pools(df)
     if action == "BUY":
-        # SL: di bawah liquidity pool bawah
         raw_sl    = pools["buy_side_liq"] - pools["buf"]
-        # pastikan SL tidak terlalu jauh (max 3× ATR) — cegah SL absurd
         sl        = max(raw_sl, price - 3.0 * atr_val)
         sl_dist   = abs(price - sl)
-        tp        = price + 2.5 * sl_dist   # RR 1:2.5
+        tp        = price + 2.5 * sl_dist
         sweep_ref = pools["buy_side_liq"]
         sweep_dir = "below"
     else:
-        # SL: di atas liquidity pool atas
         raw_sl    = pools["sell_side_liq"] + pools["buf"]
         sl        = min(raw_sl, price + 3.0 * atr_val)
         sl_dist   = abs(price - sl)
         tp        = price - 2.5 * sl_dist
         sweep_ref = pools["sell_side_liq"]
         sweep_dir = "above"
-
     rr = abs(tp - price) / sl_dist if sl_dist > 0 else 0
-
     return {
-        "tp":         tp,
-        "sl":         sl,
-        "rr":         rr,
-        "sl_dist":    sl_dist,
-        "sweep_ref":  sweep_ref,   # level pool likuiditas yang dijadikan acuan
-        "sweep_dir":  sweep_dir,   # "above" / "below"
-        "buf":        pools["buf"],
-        "buy_pool":   pools["buy_side_liq"],
-        "sell_pool":  pools["sell_side_liq"],
+        "tp": tp, "sl": sl, "rr": rr, "sl_dist": sl_dist,
+        "sweep_ref": sweep_ref, "sweep_dir": sweep_dir,
+        "buf": pools["buf"],
+        "buy_pool": pools["buy_side_liq"],
+        "sell_pool": pools["sell_side_liq"],
     }
 
 # ==================================================
-# GENERATE SIGNAL
+# GENERATE SIGNAL  (full pipeline)
 # ==================================================
 def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
-    df    = get_data(PAIRS[pair], timeframe)
-    close = df["Close"]
+    symbol = PAIRS[pair]
+    df     = get_data(symbol, timeframe)
+    close  = df["Close"]
 
-    # indicators
-    rsi_series          = rsi(close)
-    rsi_val             = float(rsi_series.iloc[-1])
-    macd_line, macd_sig, macd_hist = macd(close)
-    macd_hist_val       = float(macd_hist.iloc[-1])
-    atr_val             = float(atr(df).iloc[-1])
-    stoch_k, stoch_d    = stochastic(df)
-    stoch_k_val         = float(stoch_k.iloc[-1])
-    bb_upper, bb_mid, bb_lower = bollinger_bands(close)
-    bb_range            = float(bb_upper.iloc[-1] - bb_lower.iloc[-1])
-    bb_pos              = float(
-        (close.iloc[-1] - bb_lower.iloc[-1]) / bb_range
-        if bb_range else 0.5
+    # ── base indicators ───────────────────────────
+    rsi_series            = rsi(close)
+    rsi_val               = float(rsi_series.iloc[-1])
+    _, _, macd_h          = macd(close)
+    macd_hist_val         = float(macd_h.iloc[-1])
+    atr_val               = float(atr(df).iloc[-1])
+    stoch_k, _            = stochastic(df)
+    stoch_k_val           = float(stoch_k.iloc[-1])
+    bb_upper, _, bb_lower = bollinger_bands(close)
+    bb_range              = float(bb_upper.iloc[-1] - bb_lower.iloc[-1])
+    bb_pos                = float(
+        (close.iloc[-1] - bb_lower.iloc[-1]) / bb_range if bb_range else 0.5
     )
-    vol_ratio_val       = volume_ratio(df)
-    rsi_div             = rsi_divergence(df, rsi_series)
-    ema_conf            = ema_confluence(df)
+    vol_ratio_val  = volume_ratio(df)
+    rsi_div        = rsi_divergence(df, rsi_series)
+    ema_conf       = ema_confluence(df)
+    smc_data       = smc(df)
+    liq            = liquidity(df)
+    fl             = flow(df)
+    lstm           = lstm_prediction(df)
+    trend          = trend_strength(df)
 
-    # SMC / Liq / Flow / LSTM
-    smc_data = smc(df)
-    liq      = liquidity(df)
-    fl       = flow(df)
-    lstm     = lstm_prediction(df)
+    # ── NEW engines ───────────────────────────────
+    of             = delta_orderflow(df)
+    fvg            = fvg_engine(df)
+    sess           = session_filter(pair)
+    mtf            = mtf_bias(symbol, timeframe)   # fetches HTF data
 
-    score  = ai_score(
+    # ── advanced scoring ──────────────────────────
+    sc             = advanced_score(
         lstm, smc_data, liq, fl, rsi_val, macd_hist_val,
-        ema_conf, rsi_div, vol_ratio_val, stoch_k_val, bb_pos
+        ema_conf, rsi_div, vol_ratio_val, stoch_k_val, bb_pos,
+        of, fvg, mtf, sess, trend,
     )
-    action   = "BUY" if score >= 55 else "SELL"
-    sl_data  = tp_sl_anti_sweep(df, action, atr_val)
-    tp       = sl_data["tp"]
-    sl       = sl_data["sl"]
-    price    = float(close.iloc[-1])
-    rr       = sl_data["rr"]
+    score      = sc["total"]
+    action     = "BUY" if score >= 55 else "SELL"
+    sl_data    = tp_sl_anti_sweep(df, action, atr_val)
+    price      = float(close.iloc[-1])
 
     return {
         "pair":       pair,
         "timeframe":  timeframe,
         "score":      score,
-        "confidence": confidence_label(score),
+        "cats":       sc["cats"],
+        "confluence": sc["confluence"],
+        "confidence": confidence_label(score, sc["confluence"]),
         "action":     action,
         "entry":      price,
-        "tp":         tp,
-        "sl":         sl,
-        "rr":         rr,
+        "tp":         sl_data["tp"],
+        "sl":         sl_data["sl"],
+        "rr":         sl_data["rr"],
         "rsi":        rsi_val,
         "macd":       macd_hist_val,
         "atr":        atr_val,
@@ -447,9 +766,15 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
         "smc":        smc_data,
         "liq":        liq,
         "flow":       fl,
-        "sweep":      sl_data,   # anti-sweep detail
+        "trend":      trend,
+        "orderflow":  of,
+        "fvg":        fvg,
+        "session":    sess,
+        "mtf":        mtf,
+        "sweep":      sl_data,
         "df":         df,
     }
+
 
 # ==================================================
 # FORMAT SIGNAL (Discord Embed)
@@ -457,66 +782,141 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
 def build_embed(data: dict) -> discord.Embed:
     action_color = discord.Color.green() if data["action"] == "BUY" else discord.Color.red()
     action_emoji = "🟢" if data["action"] == "BUY" else "🔴"
-    sw           = data["sweep"]
+    sw   = data["sweep"]
+    of   = data["orderflow"]
+    fvg  = data["fvg"]
+    mtf  = data["mtf"]
+    sess = data["session"]
+    cats = data["cats"]
+    tr   = data["trend"]
 
     embed = discord.Embed(
-        title       = f"{action_emoji} {data['pair']} — {data['action']} SIGNAL",
-        description = f"**AI Score:** `{data['score']}%` — {data['confidence']}",
-        color       = action_color,
+        title = (
+            f"{action_emoji} {data['pair']} — {data['action']} SIGNAL  "
+            f"[{data['confluence']}/6 confluence]"
+        ),
+        description = (
+            f"**AI Score:** `{data['score']}%` — {data['confidence']}\n"
+            f"**Session:** `{sess['session']}`  `{sess['utc_time']}`  "
+            f"{'✅ Tradeable' if sess['tradeable'] else '⚠️ Off-session'}"
+        ),
+        color = action_color,
     )
+
+    # ── Entry / TP / SL ──────────────────────────
     embed.add_field(
         name  = "📍 Entry / 🎯 TP / 🛑 SL",
         value = (
             f"`{data['entry']:.4f}` / `{data['tp']:.4f}` / `{data['sl']:.4f}`\n"
-            f"**R:R** → `1:{data['rr']:.2f}`"
+            f"**R:R** → `1:{data['rr']:.2f}`  |  ATR: `{data['atr']:.4f}`"
         ),
         inline=False,
     )
 
-    # ── Anti-Sweep SL detail ──────────────────────
-    sweep_side = "Buy-Side Pool (Swing Low)" if data["action"] == "BUY" else "Sell-Side Pool (Swing High)"
+    # ── Score breakdown ───────────────────────────
+    def bar(v, mx):
+        filled = int(round(abs(v) / mx * 5))
+        ch = "🟩" if v >= 0 else "🟥"
+        return ch * filled + "⬜" * (5 - filled)
+
+    embed.add_field(
+        name  = "📊 Score Breakdown",
+        value = (
+            f"Trend      {bar(cats['TREND'],     25)} `{cats['TREND']:+d}`\n"
+            f"Momentum   {bar(cats['MOMENTUM'],  20)} `{cats['MOMENTUM']:+d}`\n"
+            f"SMC        {bar(cats['SMC'],        20)} `{cats['SMC']:+d}`\n"
+            f"Orderflow  {bar(cats['ORDERFLOW'], 15)} `{cats['ORDERFLOW']:+d}`\n"
+            f"FVG        {bar(cats['FVG'],        10)} `{cats['FVG']:+d}`\n"
+            f"MTF Bias   {bar(cats['MTF'],        15)} `{cats['MTF']:+d}`\n"
+            f"Session    {bar(cats['SESSION'],    10)} `{cats['SESSION']:+d}`"
+        ),
+        inline=False,
+    )
+
+    # ── MTF Bias ─────────────────────────────────
+    htf_lines = []
+    for tf, d in mtf["detail"].items():
+        if "error" not in d:
+            emoji = "🟢" if d["bias"] == "BULLISH" else "🔴" if d["bias"] == "BEARISH" else "⚪"
+            htf_lines.append(f"{emoji} `{tf.upper()}` {d['bias']}  RSI:`{d['rsi']:.0f}`")
+    embed.add_field(
+        name  = "🕐 MTF Bias",
+        value = "\n".join(htf_lines) if htf_lines else "N/A",
+        inline=True,
+    )
+
+    # ── Orderflow Delta ───────────────────────────
+    of_emoji = "🟢" if of["bias"] == "BUY" else "🔴" if of["bias"] == "SELL" else "⚪"
+    embed.add_field(
+        name  = "📦 Delta Orderflow",
+        value = (
+            f"{of_emoji} Bias: `{of['bias']}`\n"
+            f"Buy Vol: `{of['buy_vol_pct']:.1f}%`\n"
+            f"CVD Slope: `{of['cvd_slope']:.2f}`\n"
+            f"Absorption: `{'YES ⚡' if of['absorption'] else 'NO'}`"
+        ),
+        inline=True,
+    )
+
+    # ── FVG ──────────────────────────────────────
+    fvg_status = "🟩 IN BULL FVG" if fvg["in_bull_fvg"] else "🟥 IN BEAR FVG" if fvg["in_bear_fvg"] else "➖ Outside FVG"
+    nb = fvg["nearest_bull"]
+    nd = fvg["nearest_bear"]
+    embed.add_field(
+        name  = "📐 FVG / Imbalance",
+        value = (
+            f"{fvg_status}\n"
+            f"Bull FVGs: `{fvg['count_bull']}`  Bear: `{fvg['count_bear']}`\n"
+            + (f"Nearest Bull: `{nb['bottom']:.4f}`-`{nb['top']:.4f}`\n" if nb else "")
+            + (f"Nearest Bear: `{nd['bottom']:.4f}`-`{nd['top']:.4f}`" if nd else "")
+        ),
+        inline=False,
+    )
+
+    # ── Indicators ───────────────────────────────
+    div_text = {"BULLISH_DIV": "🔼 Bullish", "BEARISH_DIV": "🔽 Bearish", "NONE": "—"}
+    embed.add_field(
+        name  = "📊 Indicators",
+        value = (
+            f"RSI: `{data['rsi']:.1f}` | MACD H: `{data['macd']:.4f}`\n"
+            f"Stoch K: `{data['stoch_k']:.1f}` | BB Pos: `{data['bb_pos']:.2f}`\n"
+            f"Vol Ratio: `{data['vol_ratio']:.2f}x` | ADX: `{tr['adx']:.1f}`\n"
+            f"RSI Div: {div_text[data['rsi_div']]}"
+        ),
+        inline=True,
+    )
+
+    # ── SMC / Structure ──────────────────────────
+    ema_lbl = "🐂 Bull Stack" if data["ema"]["BULLISH_STACK"] else "🐻 Bear Stack" if data["ema"]["BEARISH_STACK"] else "Mixed"
+    embed.add_field(
+        name  = "🏗 SMC / Structure",
+        value = (
+            f"BOS:`{data['smc']['BOS']}` CHoCH:`{data['smc']['CHoCH']}` OB:`{data['smc']['ORDER_BLOCK']}`\n"
+            f"EMA: {ema_lbl}\n"
+            f"LSTM: `{data['lstm']}` | Trend: `{'Strong' if tr['trending'] else 'Weak'}`\n"
+            f"Liq Pressure: `{data['liq']['PRESSURE']}`"
+        ),
+        inline=True,
+    )
+
+    # ── Anti-Sweep SL ─────────────────────────────
+    sweep_side = "Buy-Side Pool" if data["action"] == "BUY" else "Sell-Side Pool"
     sweep_pos  = "di bawah" if data["action"] == "BUY" else "di atas"
     embed.add_field(
         name  = "🛡️ Anti Liquidity Sweep SL",
         value = (
-            f"**Liquidity Pool:** `{sw['sweep_ref']:.4f}` ({sweep_side})\n"
-            f"**Buffer beyond pool:** `{sw['buf']:.4f}`\n"
-            f"**SL ditempatkan {sweep_pos} pool** → `{data['sl']:.4f}`\n"
-            f"*SL berada di luar zona stop-hunt market maker,\n"
-            f"sehingga tidak mudah tersapu (sweep) sebelum harga bergerak.*"
+            f"Pool ref `{sw['sweep_ref']:.4f}` ({sweep_side})\n"
+            f"Buffer: `{sw['buf']:.4f}` → SL {sweep_pos} pool: `{data['sl']:.4f}`\n"
+            f"Buy Pool: `{sw['buy_pool']:.4f}` | Sell Pool: `{sw['sell_pool']:.4f}`"
         ),
         inline=False,
     )
-    embed.add_field(
-        name  = "💧 Liquidity Zones",
-        value = (
-            f"Buy-Side Pool  (Swing Low):  `{sw['buy_pool']:.4f}`\n"
-            f"Sell-Side Pool (Swing High): `{sw['sell_pool']:.4f}`"
-        ),
-        inline=False,
+
+    embed.set_footer(
+        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | AI Institutional Engine v3"
     )
-    embed.add_field(
-        name  = "📊 Indicators",
-        value = (
-            f"RSI: `{data['rsi']:.1f}` | MACD Hist: `{data['macd']:.4f}`\n"
-            f"Stoch K: `{data['stoch_k']:.1f}` | ATR: `{data['atr']:.4f}`\n"
-            f"Vol Ratio: `{data['vol_ratio']:.2f}x` | BB Pos: `{data['bb_pos']:.2f}`"
-        ),
-        inline=False,
-    )
-    div_text = {"BULLISH_DIV": "🔼 Bullish", "BEARISH_DIV": "🔽 Bearish", "NONE": "—"}
-    embed.add_field(
-        name  = "🧠 AI Analysis",
-        value = (
-            f"LSTM: `{data['lstm']}` | RSI Div: `{div_text[data['rsi_div']]}`\n"
-            f"EMA Stack: `{'🐂 Bull' if data['ema']['BULLISH_STACK'] else '🐻 Bear' if data['ema']['BEARISH_STACK'] else 'Mixed'}`\n"
-            f"BOS: `{data['smc']['BOS']}` | CHoCH: `{data['smc']['CHoCH']}` | OB: `{data['smc']['ORDER_BLOCK']}`\n"
-            f"Liq Pressure: `{data['liq']['PRESSURE']}` | Flow: `{data['flow']['FLOW']}`"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text=f"⏱ TF: {data['timeframe'].upper()} | Powered by AI Institutional Engine")
     return embed
+
 
 # ==================================================
 # CHART  — matplotlib candle chart dengan TP/SL zone
@@ -528,7 +928,8 @@ def create_chart(
     tp: float,
     sl: float,
     timeframe: str = DEFAULT_TF,
-    sweep_data: dict = None,   # dari tp_sl_anti_sweep()
+    sweep_data: dict = None,
+    fvg_data:   dict = None,   # FVG zones for chart
 ) -> str:
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -667,6 +1068,40 @@ def create_chart(
         ax.add_patch(rect)
 
     # ═══════════════════════════════════════════════
+    # LAYER 3b — FVG Zones
+    # ═══════════════════════════════════════════════
+    if fvg_data:
+        # Draw up to 3 most recent bull FVGs (cyan)
+        for fvg in fvg_data["bull_fvgs"][-3:]:
+            ax.axhspan(fvg["bottom"], fvg["top"],
+                       alpha=0.10, color="#00bcd4", zorder=2)
+            ax.axhline(fvg["top"],    color="#00bcd4", linewidth=0.6,
+                       linestyle=":", alpha=0.6, zorder=3)
+            ax.axhline(fvg["bottom"], color="#00bcd4", linewidth=0.6,
+                       linestyle=":", alpha=0.6, zorder=3)
+
+        # Draw up to 3 most recent bear FVGs (magenta)
+        for fvg in fvg_data["bear_fvgs"][-3:]:
+            ax.axhspan(fvg["bottom"], fvg["top"],
+                       alpha=0.10, color="#e040fb", zorder=2)
+            ax.axhline(fvg["top"],    color="#e040fb", linewidth=0.6,
+                       linestyle=":", alpha=0.6, zorder=3)
+            ax.axhline(fvg["bottom"], color="#e040fb", linewidth=0.6,
+                       linestyle=":", alpha=0.6, zorder=3)
+
+        # Label nearest FVGs
+        nb = fvg_data["nearest_bull"]
+        nd = fvg_data["nearest_bear"]
+        if nb:
+            ax.text(0.5, (nb["top"] + nb["bottom"]) / 2,
+                    f"  FVG↑ {nb['bottom']:.4f}-{nb['top']:.4f}",
+                    color="#00bcd4", fontsize=6.5, va="center", alpha=0.85)
+        if nd:
+            ax.text(0.5, (nd["top"] + nd["bottom"]) / 2,
+                    f"  FVG↓ {nd['bottom']:.4f}-{nd['top']:.4f}",
+                    color="#e040fb", fontsize=6.5, va="center", alpha=0.85)
+
+    # ═══════════════════════════════════════════════
     # LAYER 4 — EMA
     # ═══════════════════════════════════════════════
     ax.plot(xs, df_c["EMA8"].values,  color="#00e5ff", linewidth=1.0, label="EMA 8",  zorder=8)
@@ -747,6 +1182,8 @@ def create_chart(
         Line2D([0], [0], color="#ff9800", lw=1.4, label="EMA 50"),
         mpatches.Patch(facecolor="#00c853", alpha=0.4, label="TP Zone"),
         mpatches.Patch(facecolor="#d50000", alpha=0.4, label="SL Zone"),
+        mpatches.Patch(facecolor="#00bcd4", alpha=0.3, label="Bull FVG"),
+        mpatches.Patch(facecolor="#e040fb", alpha=0.3, label="Bear FVG"),
     ]
     if sweep_data:
         legend_items += [
@@ -871,7 +1308,7 @@ class TimeframeSelectView(View):
             view  = SignalActionView(data)
             if self.mode == "chart":
                 path = await run_blocking(
-                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"], tf, data["sweep"]
+                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"], tf, data["sweep"], data["fvg"]
                 )
                 await channel.send(
                     f"📊 **{self.pair}** `{tf.upper()}` Candle Chart",
@@ -893,7 +1330,7 @@ class SignalActionView(View):
         await interaction.response.defer()
         d    = self.data
         try:
-            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"], d["timeframe"], d["sweep"])
+            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"], d["timeframe"], d["sweep"], d["fvg"])
             await interaction.followup.send(
                 f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
                 file=discord.File(path),
@@ -1001,7 +1438,7 @@ class TimeframeSelectMenu(View):
             return
 
         best  = max(results, key=lambda x: x["score"])
-        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"])
+        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"], best["fvg"])
         embed = build_embed(best)
         view  = SignalActionView(best)
         await channel.send(embed=embed, view=view, file=discord.File(path))
@@ -1021,7 +1458,7 @@ async def send_signal_or_chart(
 
         if mode == "chart":
             path = await run_blocking(
-                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"]
+                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"], data["fvg"]
             )
             await interaction.followup.send(
                 f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
@@ -1056,7 +1493,7 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
         return
 
     best = max(results, key=lambda x: x["score"])
-    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"])
+    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"], best["fvg"])
     embed = build_embed(best)
     view  = SignalActionView(best)
     await interaction.followup.send(embed=embed, view=view, file=discord.File(path))
@@ -1179,7 +1616,7 @@ async def auto_signal_loop():
                     try:
                         data = await run_blocking(generate_signal, pair, DEFAULT_TF)
                         if data["score"] >= AUTO_MIN_SCORE:
-                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"])
+                            path  = await run_blocking(create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"], data["fvg"])
                             embed = build_embed(data)
                             view  = SignalActionView(data)
                             await channel.send(embed=embed, view=view, file=discord.File(path))
