@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["git", "python311"]
+nixPkgs = ["...", "git"]
 
 [phases.install]
 cmds = [
