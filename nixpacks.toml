@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["git", "python311"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "pip install git+https://github.com/StreamAlpha/tvdatafeed.git"
+]
