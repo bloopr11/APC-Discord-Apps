@@ -209,7 +209,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 _tv_lock       = threading.Lock()
 _tv_last_call  = 0.0
-TV_MIN_INTERVAL = 6.0   # detik jeda minimum antar koneksi TV
+TV_MIN_INTERVAL = 3.0   # 3 detik cukup untuk anonymous TV
 
 # Executor khusus TV — max 1 worker = benar-benar sequential
 _tv_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tv_fetch")
@@ -246,7 +246,7 @@ def _get_tv_semaphore():
 # IN-MEMORY CACHE
 # ==================================================
 _data_cache: dict = {}
-CACHE_TTL     = 300    # 5 menit — data utama
+CACHE_TTL     = 180    # 3 menit — cukup fresh
 CACHE_TTL_HTF = 1800   # 30 menit — HTF (1h, 4h, 1d)
 
 def _cache_get(cache_key: str, ttl: int):
@@ -674,6 +674,126 @@ def rsi_divergence(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) -
     if price_diff < 0 and rsi_diff > 0: return "BULLISH_DIV"
     if price_diff > 0 and rsi_diff < 0: return "BEARISH_DIV"
     return "NONE"
+
+# ==================================================
+# BOS CONFIRMATION  (untuk div alert)
+# Lebih ketat dari smc() biasa — perlu breakout
+# yang terkonfirmasi candle close, bukan hanya wick
+# ==================================================
+def bos_confirmation(df: pd.DataFrame, swing: int = 10) -> dict:
+    """
+    Bullish BOS : close[-1] > swing high N bars sebelumnya
+                  DAN close[-1] > close[-2]  (candle naik)
+    Bearish BOS : close[-1] < swing low  N bars sebelumnya
+                  DAN close[-1] < close[-2]  (candle turun)
+
+    Juga deteksi apakah BOS baru terjadi (di 3 candle terakhir)
+    untuk membedakan BOS lama vs fresh BOS.
+    """
+    high  = df["High"]
+    low   = df["Low"]
+    close = df["Close"]
+
+    swing_high = high.rolling(swing).max()
+    swing_low  = low.rolling(swing).min()
+
+    # BOS bullish — close tembus swing high sebelumnya
+    bull_bos = (
+        close.iloc[-1] > swing_high.iloc[-swing - 1]
+        and close.iloc[-1] > close.iloc[-2]
+    )
+    # BOS bearish — close tembus swing low sebelumnya
+    bear_bos = (
+        close.iloc[-1] < swing_low.iloc[-swing - 1]
+        and close.iloc[-1] < close.iloc[-2]
+    )
+
+    # Freshness — apakah BOS terjadi dalam 3 candle terakhir
+    fresh_bull = any(
+        close.iloc[-i] > swing_high.iloc[-swing - i]
+        for i in range(1, 4)
+    )
+    fresh_bear = any(
+        close.iloc[-i] < swing_low.iloc[-swing - i]
+        for i in range(1, 4)
+    )
+
+    return {
+        "bull_bos":   bool(bull_bos),
+        "bear_bos":   bool(bear_bos),
+        "fresh_bull": bool(fresh_bull),
+        "fresh_bear": bool(fresh_bear),
+        "swing_high": float(swing_high.iloc[-swing - 1]),
+        "swing_low":  float(swing_low.iloc[-swing - 1]),
+    }
+
+# ==================================================
+# CANDLE TREND CONFIRMATION  (untuk div alert)
+# Konfirmasi momentum candle mendukung reversal
+# ==================================================
+def candle_confirmation(df: pd.DataFrame, div_type: str) -> dict:
+    """
+    Bullish div  → cari candle konfirmasi bullish:
+      - Candle terakhir bullish (close > open)
+      - Body > 50% dari range (tidak ekor panjang)
+      - Close di atas midpoint candle sebelumnya (engulfing partial)
+      - Volume di atas rata-rata (jika tersedia)
+
+    Bearish div  → kebalikannya.
+
+    Returns konfirmasi dan detail untuk embed.
+    """
+    open_  = df["Open"]
+    high   = df["High"]
+    low    = df["Low"]
+    close  = df["Close"]
+    vol    = df["Volume"] if "Volume" in df.columns else pd.Series([0]*len(df))
+
+    o1, h1, l1, c1 = float(open_.iloc[-1]), float(high.iloc[-1]), float(low.iloc[-1]), float(close.iloc[-1])
+    o2, h2, l2, c2 = float(open_.iloc[-2]), float(high.iloc[-2]), float(low.iloc[-2]), float(close.iloc[-2])
+
+    body1     = abs(c1 - o1)
+    range1    = h1 - l1 if h1 != l1 else 0.0001
+    body_pct  = body1 / range1   # >0.5 = solid candle
+
+    mid_prev  = (o2 + c2) / 2
+
+    avg_vol   = float(vol.rolling(20).mean().iloc[-1]) if vol.sum() > 0 else 0
+    cur_vol   = float(vol.iloc[-1])
+    vol_ok    = cur_vol > avg_vol * 0.9 if avg_vol > 0 else True
+
+    if div_type == "BULLISH_DIV":
+        bull_candle  = c1 > o1                  # candle hijau
+        solid        = body_pct > 0.45           # body cukup solid
+        above_mid    = c1 > mid_prev             # close di atas mid prev
+        confirmed    = bull_candle and solid and above_mid
+        candle_type  = "Bullish" if bull_candle else "Bearish"
+        desc = (
+            f"Candle: {'Hijau' if bull_candle else 'Merah'}  "
+            f"Body: {body_pct*100:.0f}%  "
+            f"Above mid prev: {'Ya' if above_mid else 'Tidak'}  "
+            f"Vol OK: {'Ya' if vol_ok else 'Tidak'}"
+        )
+    else:
+        bear_candle  = c1 < o1
+        solid        = body_pct > 0.45
+        below_mid    = c1 < mid_prev
+        confirmed    = bear_candle and solid and below_mid
+        candle_type  = "Bearish" if bear_candle else "Bullish"
+        desc = (
+            f"Candle: {'Merah' if bear_candle else 'Hijau'}  "
+            f"Body: {body_pct*100:.0f}%  "
+            f"Below mid prev: {'Ya' if below_mid else 'Tidak'}  "
+            f"Vol OK: {'Ya' if vol_ok else 'Tidak'}"
+        )
+
+    return {
+        "confirmed":   confirmed,
+        "candle_type": candle_type,
+        "body_pct":    body_pct,
+        "vol_ok":      vol_ok,
+        "desc":        desc,
+    }
 
 # ==================================================
 # EMA CONFLUENCE
@@ -1340,12 +1460,12 @@ def create_chart(
         # Label pool di sisi kiri
         ax.text(
             0.2, buy_pool,
-            f" 💧 Buy-Side Pool  {buy_pool:.4f}",
+            f" BUY POOL  {buy_pool:.4f}",
             color="#ffd600", fontsize=7.5, va="bottom", alpha=0.85,
         )
         ax.text(
             0.2, sell_pool,
-            f" 💧 Sell-Side Pool  {sell_pool:.4f}",
+            f" SELL POOL  {sell_pool:.4f}",
             color="#ce93d8", fontsize=7.5, va="top", alpha=0.85,
         )
 
@@ -1383,14 +1503,14 @@ def create_chart(
             ax.axhline(sweep_ref, color="#ff6d00", linewidth=0.9,
                        linestyle="-.", zorder=5, alpha=0.8)
             ax.text(xs[-1] + 0.5, sweep_ref,
-                    f" 🟠 Pool  {sweep_ref:.4f}",
+                    f" POOL  {sweep_ref:.4f}",
                     color="#ff6d00", fontsize=7, va="center", fontweight="bold")
         else:
             ax.axhspan(sweep_ref, sl, alpha=0.20, color="#b71c1c", zorder=1)
             ax.axhline(sweep_ref, color="#ff6d00", linewidth=0.9,
                        linestyle="-.", zorder=5, alpha=0.8)
             ax.text(xs[-1] + 0.5, sweep_ref,
-                    f" 🟠 Pool  {sweep_ref:.4f}",
+                    f" POOL  {sweep_ref:.4f}",
                     color="#ff6d00", fontsize=7, va="center", fontweight="bold")
 
         # Buy/Sell pool horizontal markers
@@ -1450,11 +1570,11 @@ def create_chart(
         nd = fvg_data["nearest_bear"]
         if nb:
             ax.text(0.5, (nb["top"] + nb["bottom"]) / 2,
-                    f"  FVG↑ {nb['bottom']:.4f}-{nb['top']:.4f}",
+                    f"  BULL FVG {nb['bottom']:.4f}-{nb['top']:.4f}",
                     color="#00bcd4", fontsize=6.5, va="center", alpha=0.85)
         if nd:
             ax.text(0.5, (nd["top"] + nd["bottom"]) / 2,
-                    f"  FVG↓ {nd['bottom']:.4f}-{nd['top']:.4f}",
+                    f"  BEAR FVG {nd['bottom']:.4f}-{nd['top']:.4f}",
                     color="#e040fb", fontsize=6.5, va="center", alpha=0.85)
 
     # ═══════════════════════════════════════════════
@@ -1471,29 +1591,29 @@ def create_chart(
 
     # TP2 — outer target (solid bright green)
     ax.axhline(tp, color="#00e676", linewidth=1.8, linestyle="--", zorder=9)
-    ax.text(lx, tp, f" 🎯 TP2  {tp:.4f}  (RR 1:{rr2:.2f})",
+    ax.text(lx, tp, f" [TP2]  {tp:.4f}  RR 1:{rr2:.2f}",
             color="#00e676", fontsize=8, va="center", fontweight="bold")
 
     # TP1 — quick target (lighter green, solid)
     if tp1:
         ax.axhline(tp1, color="#b9f6ca", linewidth=1.3, linestyle="-.", zorder=9)
-        ax.text(lx, tp1, f" 🟩 TP1  {tp1:.4f}  (RR 1:{rr1:.2f})",
+        ax.text(lx, tp1, f" [TP1]  {tp1:.4f}  RR 1:{rr1:.2f}",
                 color="#b9f6ca", fontsize=8, va="center", fontweight="bold")
 
     # Entry
     ax.axhline(entry, color="#ffffff", linewidth=1.1, linestyle="--", zorder=9, alpha=0.85)
-    ax.text(lx, entry, f" 📍 Entry  {entry:.4f}",
+    ax.text(lx, entry, f" ENTRY  {entry:.4f}",
             color="#ffffff", fontsize=8, va="center", fontweight="bold", alpha=0.9)
 
     # SL1 — tight stop (orange)
     if sl1:
         ax.axhline(sl1, color="#ffab40", linewidth=1.3, linestyle="-.", zorder=9)
-        ax.text(lx, sl1, f" 🟡 SL1  {sl1:.4f}  (1× ATR)",
+        ax.text(lx, sl1, f" [SL1]  {sl1:.4f}  1xATR",
                 color="#ffab40", fontsize=8, va="center", fontweight="bold")
 
     # SL2 — anti-sweep (red)
     ax.axhline(sl, color="#ff1744", linewidth=1.8, linestyle="--", zorder=9)
-    ax.text(lx, sl, f" 🛡️ SL2  {sl:.4f}  (anti-sweep)",
+    ax.text(lx, sl, f" [SL2]  {sl:.4f}  anti-sweep",
             color="#ff1744", fontsize=8, va="center", fontweight="bold")
 
     # ═══════════════════════════════════════════════
@@ -1595,22 +1715,21 @@ def create_chart(
     # Info bar bawah — ringkasan anti-sweep
     # ═══════════════════════════════════════════════
     if sweep_data:
-        tp1_str  = f"{tp1:.4f}" if tp1 else "—"
-        sl1_str  = f"{sl1:.4f}" if sl1 else "—"
+        tp1_str  = f"{tp1:.4f}" if tp1 else "-"
+        sl1_str  = f"{sl1:.4f}" if sl1 else "-"
         sweep_txt = (
-            f"🟩 TP1 {tp1_str} (RR 1:{rr1:.2f})  │  "
-            f"🎯 TP2 {tp:.4f} (RR 1:{rr2:.2f})  ║  "
-            f"🟡 SL1 {sl1_str} (tight)  │  "
-            f"🛡️ SL2 {sl:.4f} (anti-sweep, pool {sweep_data['sweep_ref']:.4f})"
+            f"[TP1] {tp1_str} (RR 1:{rr1:.2f})  |  "
+            f"[TP2] {tp:.4f} (RR 1:{rr2:.2f})  ||  "
+            f"[SL1] {sl1_str} tight  |  "
+            f"[SL2] {sl:.4f} anti-sweep  pool@{sweep_data['sweep_ref']:.4f}"
         )
     else:
-        tp1_str = f"{tp1:.4f}" if tp1 else "—"
-        sl1_str = f"{sl1:.4f}" if sl1 else "—"
+        tp1_str = f"{tp1:.4f}" if tp1 else "-"
+        sl1_str = f"{sl1:.4f}" if sl1 else "-"
         sweep_txt = (
-            f"🟩 TP1 {tp1_str}  │  🎯 TP2 {tp:.4f}  ║  "
-            f"🟡 SL1 {sl1_str}  │  🛡️ SL2 {sl:.4f}"
+            f"[TP1] {tp1_str}  |  [TP2] {tp:.4f}  ||  "
+            f"[SL1] {sl1_str}  |  [SL2] {sl:.4f}"
         )
-
     ax2.text(
         0.5, 0.5, sweep_txt,
         transform=ax2.transAxes,
@@ -2274,16 +2393,16 @@ def create_div_chart(
     # ── TP/SL lines ───────────────────────────────
     lx = xs[-1] + 0.5
     ax_c.axhline(tp2,   color="#00e676", lw=1.5, linestyle="--", zorder=9)
-    ax_c.text(lx, tp2,  f" 🎯TP2 {tp2:.4f}", color="#00e676",  fontsize=7.5, va="center", fontweight="bold")
+    ax_c.text(lx, tp2,  f" TP2 {tp2:.4f}", color="#00e676",  fontsize=7.5, va="center", fontweight="bold")
     ax_c.axhline(tp1,   color="#b9f6ca", lw=1.2, linestyle="-.", zorder=9)
-    ax_c.text(lx, tp1,  f" 🟩TP1 {tp1:.4f}", color="#b9f6ca",  fontsize=7.5, va="center", fontweight="bold")
+    ax_c.text(lx, tp1,  f" TP1 {tp1:.4f}", color="#b9f6ca",  fontsize=7.5, va="center", fontweight="bold")
     ax_c.axhline(entry, color="#ffffff", lw=1.0, linestyle="--", zorder=9, alpha=0.85)
-    ax_c.text(lx, entry,f" 📍 {entry:.4f}",  color="#ffffff",  fontsize=7.5, va="center", fontweight="bold")
+    ax_c.text(lx, entry,f" ENTRY {entry:.4f}",  color="#ffffff",  fontsize=7.5, va="center", fontweight="bold")
     ax_c.axhline(sl2,   color="#ff1744", lw=1.5, linestyle="--", zorder=9)
-    ax_c.text(lx, sl2,  f" 🛡️SL2 {sl2:.4f}", color="#ff1744",  fontsize=7.5, va="center", fontweight="bold")
+    ax_c.text(lx, sl2,  f" SL2 {sl2:.4f}", color="#ff1744",  fontsize=7.5, va="center", fontweight="bold")
     if sl1:
         ax_c.axhline(sl1, color="#ffab40", lw=1.2, linestyle="-.", zorder=9)
-        ax_c.text(lx, sl1, f" 🟡SL1 {sl1:.4f}", color="#ffab40", fontsize=7.5, va="center", fontweight="bold")
+        ax_c.text(lx, sl1, f" SL1 {sl1:.4f}", color="#ffab40", fontsize=7.5, va="center", fontweight="bold")
 
     # ── Divergence annotation on price ───────────
     lookback = div["lookback"]
@@ -2304,7 +2423,7 @@ def create_div_chart(
     mid_x = (x_prev + x_now) / 2
     mid_y = (y_prev + y_now) / 2
     ax_c.text(mid_x, mid_y,
-              f" {'🔼 BULL DIV' if is_bull else '🔽 BEAR DIV'}",
+              f" {'BULL DIV' if is_bull else 'BEAR DIV'}",
               color=div_color, fontsize=9, fontweight="bold",
               bbox=dict(facecolor="#0d1117", edgecolor=div_color,
                         boxstyle="round,pad=0.3", alpha=0.85))
@@ -2389,56 +2508,85 @@ def create_div_chart(
 
 async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
     """
-    Scan satu pair untuk RSI divergence.
-    Kirim notifikasi jika:
-      - Divergence terdeteksi (bull atau bear)
-      - AI score >= 65
-      - Belum ada notif pair ini dalam DIV_COOLDOWN detik
+    Kirim RSI Div alert jika SEMUA filter terpenuhi:
+      1. TF >= 15m (15m, 1h, 4h)
+      2. Divergence terdeteksi (bull/bear)
+      3. BOS terkonfirmasi searah divergence (fresh BOS)
+      4. Candle konfirmasi solid searah reversal
+      5. AI score >= 65
+      6. Cooldown 1 jam per pair per TF
     """
     global _div_sent
+
+    # ── Filter 1: hanya 15m keatas ───────────────
+    if timeframe not in ("15m", "1h", "4h"):
+        return
+
     try:
         data     = await run_blocking(generate_signal, pair, timeframe)
         div_type = data["rsi_div"]
+        df       = data["df"]
+        close    = df["Close"]
 
-        # Filter: hanya bull/bear, bukan NONE
+        # ── Filter 2: divergence harus ada ───────
         if div_type == "NONE":
             return
 
-        # Filter: AI score >= 65
-        if data["score"] < 65:
+        # ── Filter 3: BOS konfirmasi ──────────────
+        bos = bos_confirmation(df, swing=10)
+        if div_type == "BULLISH_DIV":
+            # BOS bullish harus ada (fresh) untuk konfirmasi
+            if not bos["fresh_bull"]:
+                print(f"[DIV SKIP] {pair} {timeframe}: BULLISH_DIV tapi no fresh bull BOS")
+                return
+        else:
+            if not bos["fresh_bear"]:
+                print(f"[DIV SKIP] {pair} {timeframe}: BEARISH_DIV tapi no fresh bear BOS")
+                return
+
+        # ── Filter 4: candle konfirmasi ───────────
+        candle = candle_confirmation(df, div_type)
+        if not candle["confirmed"]:
+            print(f"[DIV SKIP] {pair} {timeframe}: {div_type} candle not confirmed — {candle['desc']}")
             return
 
-        # Cooldown check
-        cache_key = f"{pair}_{timeframe}"
+        # ── Filter 5: AI score ────────────────────
+        if data["score"] < 65:
+            print(f"[DIV SKIP] {pair} {timeframe}: score {data['score']} < 65")
+            return
+
+        # ── Filter 6: cooldown ────────────────────
+        cache_key = f"{pair}_{timeframe}_div"
         now       = time.time()
         last      = _div_sent.get(cache_key, {})
         if last.get("type") == div_type and (now - last.get("ts", 0)) < DIV_COOLDOWN:
-            return   # sudah dikirim belum lama
+            return
 
-        # Generate detail divergence
-        df       = data["df"]
-        close    = df["Close"]
-        rsi_s    = rsi(close)
-        div_det  = _rsi_div_detail(df, rsi_s, lookback=5)
+        # ── Semua filter lolos → kirim ────────────
+        rsi_s   = rsi(close)
+        div_det = _rsi_div_detail(df, rsi_s, lookback=5)
 
-        # Build embed + chart
+        # inject BOS + candle ke div_det untuk embed
+        div_det["bos"]    = bos
+        div_det["candle"] = candle
+
         embed = build_div_embed(pair, timeframe, div_det, data)
         path  = await run_blocking(create_div_chart, df, pair, timeframe, div_det, data)
 
-        # Kirim ke channel
         await channel.send(
             content = (
-                f"🔔 **RSI DIVERGENCE ALERT** — `{pair}` `{timeframe.upper()}`\n"
+                f"🔔 **RSI DIV ALERT** — `{pair}` `{timeframe.upper()}`\n"
                 f"{'🔼 BULLISH' if div_type == 'BULLISH_DIV' else '🔽 BEARISH'} | "
+                f"BOS: {'Fresh Bull' if bos['fresh_bull'] else 'Fresh Bear'} | "
+                f"Candle: {candle['candle_type']} | "
                 f"Score: `{data['score']}%` | {data['confidence']}"
             ),
             embed = embed,
             file  = discord.File(path),
         )
 
-        # Update state
         _div_sent[cache_key] = {"type": div_type, "ts": now}
-        print(f"[DIV ALERT] {pair} {timeframe} {div_type} score={data['score']}")
+        print(f"[DIV ALERT SENT] {pair} {timeframe} {div_type} score={data['score']}")
 
     except Exception as e:
         tb = traceback.format_exc()
