@@ -1,5 +1,5 @@
 discord.py==2.3.2
-tvdatafeed
+tvdatafeed @ git+https://github.com/StreamAlpha/tvdatafeed.git
 yfinance
 pandas
 numpy
