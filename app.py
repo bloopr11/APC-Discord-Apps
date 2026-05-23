@@ -554,7 +554,7 @@ ASIA_ACTIVE = {"BTCUSD", "ETHUSD", "BNBUSD", "ADAUSD", "XRPUSD",
 
 def session_filter(pair: str) -> dict:
     """Return current session, score modifier, and whether to trade."""
-    now_utc  = dt.datetime.utcnow().time()
+    now_utc  = dt.datetime.now(dt.timezone.utc).time()
     active   = []
 
     for name, cfg in SESSIONS.items():
@@ -590,7 +590,7 @@ def session_filter(pair: str) -> dict:
         "session":   session,
         "score_mod": score_mod,
         "tradeable": tradeable,
-        "utc_time":  dt.datetime.utcnow().strftime("%H:%M UTC"),
+        "utc_time":  dt.datetime.now(dt.timezone.utc).strftime("%H:%M UTC"),
     }
 
 # ==================================================
