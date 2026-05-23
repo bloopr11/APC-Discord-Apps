@@ -199,37 +199,40 @@ def _check_tv_available() -> bool:
     return _tv_ok
 
 # ==================================================
-# TV RATE LIMIT — Semaphore global
-# TV anonymous toleransi ~6-8 koneksi/menit
-# Semaphore(2) = max 2 koneksi TV bersamaan
-# + jeda minimum 4 detik antar koneksi
+# TV RATE LIMIT — threading.Lock (true sequential)
+# asyncio.Semaphore tidak efektif karena TV calls
+# berjalan di thread pool (run_in_executor) —
+# threading.Lock memastikan benar-benar antri satu-satu
 # ==================================================
-_tv_semaphore  = None   # diinisialisasi setelah event loop ada
-_tv_last_call  = 0.0
-TV_MIN_INTERVAL = 4.0   # detik minimum antar koneksi TV
+import threading
 
-def _get_tv_semaphore():
-    """Lazy-init semaphore — harus dipanggil setelah event loop running."""
-    global _tv_semaphore
-    if _tv_semaphore is None:
-        _tv_semaphore = asyncio.Semaphore(2)
-    return _tv_semaphore
+_tv_lock       = threading.Lock()
+_tv_last_call  = 0.0
+TV_MIN_INTERVAL = 6.0   # detik jeda minimum antar koneksi TV
 
 def _tv_throttle_sync():
-    """Throttle blocking — dipakai di thread pool."""
+    """
+    Acquire lock → tunggu jeda min → lanjut fetch.
+    Semua TV calls antri satu per satu, tidak ada yang
+    bisa bypass meskipun dipanggil dari thread berbeda.
+    """
     global _tv_last_call
-    elapsed = time.time() - _tv_last_call
-    if elapsed < TV_MIN_INTERVAL:
-        time.sleep(TV_MIN_INTERVAL - elapsed)
-    _tv_last_call = time.time()
+    with _tv_lock:
+        elapsed = time.time() - _tv_last_call
+        if elapsed < TV_MIN_INTERVAL:
+            time.sleep(TV_MIN_INTERVAL - elapsed)
+        _tv_last_call = time.time()
+
+def _get_tv_semaphore():
+    """Kept for compatibility — no-op."""
+    return asyncio.Semaphore(999)
 
 # ==================================================
 # IN-MEMORY CACHE
-# TTL panjang → drastis kurangi hit ke TV
 # ==================================================
 _data_cache: dict = {}
 CACHE_TTL     = 300    # 5 menit — data utama
-CACHE_TTL_HTF = 1800   # 30 menit — HTF (jarang berubah)
+CACHE_TTL_HTF = 1800   # 30 menit — HTF (1h, 4h, 1d)
 
 def _cached(cache_key: str, ttl: int, fetch_fn):
     now = time.time()
@@ -253,7 +256,7 @@ def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
         df = None
         if _check_tv_available():
             try:
-                _tv_throttle_sync()
+                _tv_throttle_sync()   # antri sequential
                 exchange, tv_sym = pair_info["tv"]
                 df = _fetch_tv_ws(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
                 print(f"[TV✅] {pair_key} {timeframe} {len(df)} bars")
@@ -276,7 +279,7 @@ def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
         df = None
         if _check_tv_available():
             try:
-                _tv_throttle_sync()
+                _tv_throttle_sync()   # antri sequential
                 exchange, tv_sym = pair_info["tv"]
                 df = _fetch_tv_ws(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
             except ConnectionError:
@@ -288,9 +291,6 @@ def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
         return df
 
     return _cached(cache_key, CACHE_TTL_HTF, fetch)
-
-
-
 
 
 
