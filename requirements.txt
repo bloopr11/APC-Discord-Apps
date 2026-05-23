@@ -3,3 +3,4 @@ yfinance
 pandas
 numpy
 matplotlib
+tvdatafeed @ git+https://github.com/StreamAlpha/tvdatafeed.git
