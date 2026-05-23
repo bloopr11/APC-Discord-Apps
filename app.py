@@ -263,7 +263,7 @@ def _cache_set(cache_key: str, df):
 # ==================================================
 # PUBLIC DATA API  (async — pakai TV executor)
 # ==================================================
-async def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
+def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
     cfg       = TIMEFRAMES.get(timeframe, TIMEFRAMES[DEFAULT_TF])
     pair_info = PAIRS[pair_key]
     cache_key = f"{pair_key}_{timeframe}"
@@ -294,7 +294,7 @@ async def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
     _cache_set(cache_key, df)
     return df
 
-async def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
+def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
     cfg       = MTF_FETCH.get(tf, MTF_FETCH["1h"])
     pair_info = PAIRS[pair_key]
     cache_key = f"{pair_key}_{tf}_htf"
