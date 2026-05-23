@@ -84,76 +84,78 @@ def _tv_parse(raw: str) -> list:
 
 def _fetch_tv_ws(exchange: str, symbol: str, interval: str, bars: int) -> pd.DataFrame:
     """
-    Fetch OHLCV dari TradingView via WebSocket protocol.
-    Hanya butuh: websockets (pip install websockets)
+    Fetch OHLCV dari TradingView via WebSocket.
+    Satu koneksi per request, dengan retry jika 429.
     """
-    import websockets.sync.client as wsc   # websockets>=12 sync API
+    import websockets.sync.client as wsc
 
     full_sym  = f"{exchange}:{symbol}"
     cs_token  = f"cs_{_tv_token()}"
     qs_token  = f"qs_{_tv_token()}"
 
-    WS_URL = "wss://data.tradingview.com/socket.io/websocket"
+    WS_URL  = "wss://data.tradingview.com/socket.io/websocket"
     HEADERS = {
-        "Origin": "https://www.tradingview.com",
-        "User-Agent": "Mozilla/5.0",
+        "Origin":     "https://www.tradingview.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
     }
 
     candles = []
 
-    with wsc.connect(WS_URL, additional_headers=HEADERS, open_timeout=10) as ws:
-        # Handshake
-        ws.send(_tv_msg("set_auth_token", ["unauthorized_user_token"]))
-        ws.send(_tv_msg("chart_create_session", [cs_token, ""]))
-        ws.send(_tv_msg("quote_create_session", [qs_token]))
-        ws.send(_tv_msg("quote_set_fields", [qs_token,
-            "ch", "chp", "current_session", "description",
-            "local_description", "language", "exchange",
-            "fractional", "is_tradable", "lp", "lp_time",
-            "minmov", "minmov2", "original_name", "pricescale",
-            "pro_name", "short_name", "type", "update_mode", "volume",
-        ]))
-        ws.send(_tv_msg("quote_add_symbols",  [qs_token, full_sym]))
-        ws.send(_tv_msg("resolve_symbol", [cs_token, "sds_sym_1",
-            f'={{"symbol":"{full_sym}","adjustment":"splits"}}']))
-        ws.send(_tv_msg("create_series", [
-            cs_token, "sds_1", "s1", "sds_sym_1", interval, bars, ""
-        ]))
+    try:
+        with wsc.connect(WS_URL, additional_headers=HEADERS,
+                         open_timeout=12, close_timeout=5) as ws:
+            ws.send(_tv_msg("set_auth_token",    ["unauthorized_user_token"]))
+            ws.send(_tv_msg("chart_create_session", [cs_token, ""]))
+            ws.send(_tv_msg("quote_create_session", [qs_token]))
+            ws.send(_tv_msg("resolve_symbol", [cs_token, "sds_sym_1",
+                f'={{"symbol":"{full_sym}","adjustment":"splits"}}']))
+            ws.send(_tv_msg("create_series", [
+                cs_token, "sds_1", "s1", "sds_sym_1", interval, bars, ""
+            ]))
 
-        deadline = time.time() + 15   # max 15 detik tunggu data
-        while time.time() < deadline:
-            try:
-                raw = ws.recv(timeout=5)
-            except Exception:
-                break
-
-            # heartbeat
-            if "~h~" in raw:
-                ws.send(f"~m~{len(raw)}~m~{raw}")
-                continue
-
-            for msg in _tv_parse(raw):
-                m = msg.get("m", "")
-                if m == "timescale_update":
-                    bars_data = (msg.get("p", [{}])[1] or {}).get("sds_1", {}).get("s", [])
-                    for b in bars_data:
-                        v = b.get("v", [])
-                        if len(v) >= 5:
-                            candles.append({
-                                "ts":     v[0],
-                                "Open":   v[1],
-                                "High":   v[2],
-                                "Low":    v[3],
-                                "Close":  v[4],
-                                "Volume": v[5] if len(v) > 5 else 0,
-                            })
-                elif m == "series_completed":
-                    break   # done
-
-            if candles:
-                # brief wait for any remaining bars
-                if time.time() > deadline - 10:
+            deadline  = time.time() + 20
+            completed = False
+            while time.time() < deadline and not completed:
+                try:
+                    raw = ws.recv(timeout=6)
+                except Exception:
                     break
+
+                # heartbeat reply
+                if "~h~" in raw:
+                    ws.send(f"~m~{len(raw)}~m~{raw}")
+                    continue
+
+                for msg in _tv_parse(raw):
+                    m = msg.get("m", "")
+                    if m == "timescale_update":
+                        bars_data = (
+                            (msg.get("p") or [{}])[1] or {}
+                        ).get("sds_1", {}).get("s", [])
+                        for b in bars_data:
+                            v = b.get("v", [])
+                            if len(v) >= 5:
+                                candles.append({
+                                    "ts":     v[0],
+                                    "Open":   v[1],
+                                    "High":   v[2],
+                                    "Low":    v[3],
+                                    "Close":  v[4],
+                                    "Volume": v[5] if len(v) > 5 else 0,
+                                })
+                    elif m == "series_completed":
+                        completed = True
+                        break
+                    elif m == "series_error":
+                        raise ValueError(f"TV series_error: {msg}")
+
+    except Exception as e:
+        err = str(e)
+        if "429" in err:
+            raise ConnectionError("TV_RATE_LIMITED")
+        raise
 
     if not candles:
         raise ValueError("No candles received from TradingView WS")
@@ -181,7 +183,7 @@ def _fetch_yf(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
 # ==================================================
 # TV AVAILABLE CHECK  (lazy, once)
 # ==================================================
-_tv_ok: bool | None = None   # None = belum dicek
+_tv_ok: bool | None = None
 
 def _check_tv_available() -> bool:
     global _tv_ok
@@ -197,10 +199,37 @@ def _check_tv_available() -> bool:
     return _tv_ok
 
 # ==================================================
+# TV RATE LIMIT — Semaphore global
+# TV anonymous toleransi ~6-8 koneksi/menit
+# Semaphore(2) = max 2 koneksi TV bersamaan
+# + jeda minimum 4 detik antar koneksi
+# ==================================================
+_tv_semaphore  = None   # diinisialisasi setelah event loop ada
+_tv_last_call  = 0.0
+TV_MIN_INTERVAL = 4.0   # detik minimum antar koneksi TV
+
+def _get_tv_semaphore():
+    """Lazy-init semaphore — harus dipanggil setelah event loop running."""
+    global _tv_semaphore
+    if _tv_semaphore is None:
+        _tv_semaphore = asyncio.Semaphore(2)
+    return _tv_semaphore
+
+def _tv_throttle_sync():
+    """Throttle blocking — dipakai di thread pool."""
+    global _tv_last_call
+    elapsed = time.time() - _tv_last_call
+    if elapsed < TV_MIN_INTERVAL:
+        time.sleep(TV_MIN_INTERVAL - elapsed)
+    _tv_last_call = time.time()
+
+# ==================================================
 # IN-MEMORY CACHE
+# TTL panjang → drastis kurangi hit ke TV
 # ==================================================
 _data_cache: dict = {}
-CACHE_TTL = 60   # detik
+CACHE_TTL     = 300    # 5 menit — data utama
+CACHE_TTL_HTF = 1800   # 30 menit — HTF (jarang berubah)
 
 def _cached(cache_key: str, ttl: int, fetch_fn):
     now = time.time()
@@ -224,9 +253,12 @@ def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
         df = None
         if _check_tv_available():
             try:
+                _tv_throttle_sync()
                 exchange, tv_sym = pair_info["tv"]
                 df = _fetch_tv_ws(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
                 print(f"[TV✅] {pair_key} {timeframe} {len(df)} bars")
+            except ConnectionError:
+                print(f"[TV⚠️ ] {pair_key} {timeframe}: rate limited → Yahoo")
             except Exception as e:
                 print(f"[TV❌] {pair_key} {timeframe}: {e} → Yahoo")
         if df is None or len(df) < 30:
@@ -244,15 +276,21 @@ def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
         df = None
         if _check_tv_available():
             try:
+                _tv_throttle_sync()
                 exchange, tv_sym = pair_info["tv"]
                 df = _fetch_tv_ws(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
+            except ConnectionError:
+                print(f"[TV HTF⚠️ ] {pair_key} {tf}: rate limited → Yahoo")
             except Exception as e:
                 print(f"[TV HTF❌] {pair_key} {tf}: {e} → Yahoo")
         if df is None or len(df) < 30:
             df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
         return df
 
-    return _cached(cache_key, CACHE_TTL * 5, fetch)
+    return _cached(cache_key, CACHE_TTL_HTF, fetch)
+
+
+
 
 
 
@@ -1574,7 +1612,7 @@ class PairSelectView(View):
         self.mode      = mode   # "signal" | "chart"
 
         options = [
-            discord.SelectOption(label=p, description=PAIRS[p], emoji="📈")
+            discord.SelectOption(label=p, description=PAIRS[p]["yf"], emoji="📈")
             for p in PAIRS
         ]
         select = Select(
@@ -1794,13 +1832,15 @@ async def send_signal_or_chart(
 # HELPER: scan best pair
 # ==================================================
 async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
-    # scan semua pair secara concurrent (bukan sequential)
+    sem = _get_tv_semaphore()
+
     async def _safe_signal(pair):
-        try:
-            return await run_blocking(generate_signal, pair, timeframe)
-        except Exception as e:
-            print(f"SCAN ERROR {pair}: {e}")
-            return None
+        async with sem:   # max 2 TV calls bersamaan
+            try:
+                return await run_blocking(generate_signal, pair, timeframe)
+            except Exception as e:
+                print(f"SCAN ERROR {pair}: {e}")
+                return None
 
     results = await asyncio.gather(*[_safe_signal(p) for p in PAIRS])
     results = [r for r in results if r is not None]
@@ -1809,7 +1849,7 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
         await interaction.followup.send("❌ Tidak ada signal tersedia.")
         return
 
-    best = max(results, key=lambda x: x["score"])
+    best  = max(results, key=lambda x: x["score"])
     path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"], best["fvg"], best["tp1"], best["sl1"], best["rr1"], best["rr2"])
     embed = build_embed(best)
     view  = SignalActionView(best)
@@ -1819,11 +1859,14 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
 # HELPER: scan all pairs
 # ==================================================
 async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: str):
+    sem = _get_tv_semaphore()
+
     async def _safe_signal(pair):
-        try:
-            return pair, await run_blocking(generate_signal, pair, timeframe), None
-        except Exception as e:
-            return pair, None, str(e)
+        async with sem:
+            try:
+                return pair, await run_blocking(generate_signal, pair, timeframe), None
+            except Exception as e:
+                return pair, None, str(e)
 
     results = await asyncio.gather(*[_safe_signal(p) for p in PAIRS])
 
