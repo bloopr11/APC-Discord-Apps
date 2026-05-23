@@ -5,6 +5,7 @@ import asyncio
 import os
 import functools
 import time
+import traceback
 import pandas as pd
 import numpy as np
 
@@ -1707,7 +1708,9 @@ class TimeframeSelectView(View):
             else:
                 await channel.send(embed=embed, view=view)
         except Exception as e:
-            await channel.send(f"❌ Error `{self.pair}` `{tf}`: {e}")
+            tb = traceback.format_exc()
+            print(f"TF SELECT ERROR [{self.pair}|{tf}]:\n{tb}")
+            await channel.send(f"❌ Error `{self.pair}` `{tf}`: `{e}`")
 
 # ── Signal result buttons ─────────────────────────
 class SignalActionView(View):
@@ -1726,6 +1729,8 @@ class SignalActionView(View):
                 file=discord.File(path),
             )
         except Exception as e:
+            tb = traceback.format_exc()
+            print(f"CHART ERROR:\n{tb}")
             await interaction.followup.send(f"❌ Gagal buat chart: `{e}`")
 
     @discord.ui.button(label="🔄 Rescan Pair Ini", style=discord.ButtonStyle.secondary)
@@ -1737,6 +1742,8 @@ class SignalActionView(View):
             view     = SignalActionView(new_data)
             await interaction.followup.send(embed=embed, view=view)
         except Exception as e:
+            tb = traceback.format_exc()
+            print(f"RESCAN ERROR:\n{tb}")
             await interaction.followup.send(f"❌ Gagal rescan: `{e}`")
 
     @discord.ui.button(label="📋 Ganti Timeframe", style=discord.ButtonStyle.secondary)
@@ -1860,7 +1867,8 @@ async def send_signal_or_chart(
             await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
-        print(f"send_signal_or_chart ERROR [{pair}|{timeframe}]: {e}")
+        tb = traceback.format_exc()
+        print(f"send_signal_or_chart ERROR [{pair}|{timeframe}]:\n{tb}")
         await interaction.followup.send(f"❌ Error memproses {pair}: `{e}`")
 
 # ==================================================
@@ -2436,7 +2444,8 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
         print(f"[DIV ALERT] {pair} {timeframe} {div_type} score={data['score']}")
 
     except Exception as e:
-        print(f"[DIV CHECK ERROR] {pair}: {e}")
+        tb = traceback.format_exc()
+        print(f"[DIV CHECK ERROR] {pair} {timeframe}:\n{tb}")
 
 async def div_scan_loop():
     """
