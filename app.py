@@ -275,9 +275,8 @@ def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
     df = None
     if _check_tv_available():
         try:
-            # run di TV dedicated executor — tidak blocking Discord
-            df = await run_tv_blocking(
-                _fetch_with_throttle,
+            _tv_throttle_sync()
+            df = _fetch_tv_ws(
                 pair_info["tv"][0], pair_info["tv"][1],
                 cfg["tv_interval"], cfg["bars"],
             )
@@ -288,8 +287,7 @@ def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
             print(f"[TV❌] {pair_key} {timeframe}: {e} → Yahoo")
 
     if df is None or len(df) < 30:
-        df = await run_blocking(_fetch_yf,
-            pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
+        df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
 
     _cache_set(cache_key, df)
     return df
@@ -306,8 +304,8 @@ def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
     df = None
     if _check_tv_available():
         try:
-            df = await run_tv_blocking(
-                _fetch_with_throttle,
+            _tv_throttle_sync()
+            df = _fetch_tv_ws(
                 pair_info["tv"][0], pair_info["tv"][1],
                 cfg["tv_interval"], cfg["bars"],
             )
@@ -317,8 +315,7 @@ def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
             print(f"[TV HTF❌] {pair_key} {tf}: {e} → Yahoo")
 
     if df is None or len(df) < 30:
-        df = await run_blocking(_fetch_yf,
-            pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
+        df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
 
     _cache_set(cache_key, df)
     return df
