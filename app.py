@@ -16,13 +16,11 @@ matplotlib.use("Agg")
 # ==================================================
 TOKEN      = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-TV_USERNAME = os.getenv("TV_USERNAME", "")   # TradingView username (opsional)
-TV_PASSWORD = os.getenv("TV_PASSWORD", "")   # TradingView password (opsional)
+TV_USERNAME = os.getenv("TV_USERNAME", "")
+TV_PASSWORD = os.getenv("TV_PASSWORD", "")
 
 # ==================================================
-# PAIRS
-# TV symbol format: (exchange, symbol)
-# Yahoo fallback symbol
+# PAIRS config
 # ==================================================
 PAIRS = {
     "BTCUSD":  {"tv": ("BINANCE",  "BTCUSDT"),  "yf": "BTC-USD"},
@@ -38,15 +36,15 @@ PAIRS = {
 }
 
 TIMEFRAMES = {
-    "5m":  {"tv_interval": "5m",   "yf_period": "5d",   "yf_interval": "5m",  "bars": 500},
-    "15m": {"tv_interval": "15m",  "yf_period": "7d",   "yf_interval": "15m", "bars": 500},
-    "1h":  {"tv_interval": "1h",   "yf_period": "30d",  "yf_interval": "1h",  "bars": 500},
-    "4h":  {"tv_interval": "4h",   "yf_period": "60d",  "yf_interval": "4h",  "bars": 300},
+    "5m":  {"tv_interval": "5",    "yf_period": "5d",   "yf_interval": "5m",  "bars": 500},
+    "15m": {"tv_interval": "15",   "yf_period": "7d",   "yf_interval": "15m", "bars": 500},
+    "1h":  {"tv_interval": "60",   "yf_period": "30d",  "yf_interval": "1h",  "bars": 500},
+    "4h":  {"tv_interval": "240",  "yf_period": "60d",  "yf_interval": "4h",  "bars": 300},
 }
 
 MTF_FETCH = {
-    "1h":  {"tv_interval": "1h",   "yf_period": "30d",  "yf_interval": "1h",  "bars": 300},
-    "4h":  {"tv_interval": "4h",   "yf_period": "60d",  "yf_interval": "4h",  "bars": 200},
+    "1h":  {"tv_interval": "60",   "yf_period": "30d",  "yf_interval": "1h",  "bars": 300},
+    "4h":  {"tv_interval": "240",  "yf_period": "60d",  "yf_interval": "4h",  "bars": 200},
     "1d":  {"tv_interval": "1D",   "yf_period": "180d", "yf_interval": "1d",  "bars": 200},
     "1wk": {"tv_interval": "1W",   "yf_period": "730d", "yf_interval": "1wk", "bars": 100},
 }
@@ -56,143 +54,207 @@ AUTO_SIGNAL    = False
 AUTO_MIN_SCORE = 75
 
 # ==================================================
-# TRADINGVIEW DATA LAYER
-# tvdatafeed (unofficial) dengan Yahoo Finance fallback
+# TRADINGVIEW WEBSOCKET  — self-contained, no tvdatafeed
+# Uses only: websockets (PyPI), json, re (stdlib)
+# Protocol reverse-engineered from TradingView browser WS
 # ==================================================
-_tv_client   = None   # singleton TvDatafeed instance
-_tv_ok       = False  # apakah TV berhasil connect
+import json, re, random, string
 
-def _init_tv():
-    """
-    Inisialisasi tvdatafeed sekali — pakai credentials jika ada,
-    anonymous jika tidak. Fallback ke Yahoo jika import gagal.
-    """
-    global _tv_client, _tv_ok
-    if _tv_client is not None:
-        return _tv_ok
-    try:
-        from tvdatafeed import TvDatafeed, Interval
-        if TV_USERNAME and TV_PASSWORD:
-            _tv_client = TvDatafeed(TV_USERNAME, TV_PASSWORD)
-            print("✅ TradingView: logged in")
-        else:
-            _tv_client = TvDatafeed()
-            print("⚠️  TradingView: anonymous (rate-limited)")
-        _tv_ok = True
-    except Exception as e:
-        print(f"❌ TradingView init failed: {e} — using Yahoo Finance")
-        _tv_ok = False
-    return _tv_ok
+def _tv_token() -> str:
+    """Generate random session token like TradingView browser."""
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
 
-def _tv_interval(tf_str: str):
-    """Map timeframe string → tvdatafeed Interval enum."""
-    from tvdatafeed import Interval
-    _map = {
-        "5m": Interval.in_5_minute,   "15m": Interval.in_15_minute,
-        "1h": Interval.in_1_hour,     "4h":  Interval.in_4_hour,
-        "1D": Interval.in_daily,      "1W":  Interval.in_weekly,
+def _tv_msg(func: str, args: list) -> str:
+    """Encode a TradingView WebSocket protocol message."""
+    payload = json.dumps({"m": func, "p": args}, separators=(",", ":"))
+    return f"~m~{len(payload)}~m~{payload}"
+
+def _tv_parse(raw: str) -> list:
+    """Parse raw TV WS frames into list of message dicts."""
+    msgs = []
+    for chunk in re.findall(r"~m~\d+~m~(.+?)(?=~m~\d+~m~|$)", raw, re.DOTALL):
+        chunk = chunk.strip()
+        if not chunk or chunk.startswith("~h~"):
+            continue
+        try:
+            msgs.append(json.loads(chunk))
+        except Exception:
+            pass
+    return msgs
+
+def _fetch_tv_ws(exchange: str, symbol: str, interval: str, bars: int) -> pd.DataFrame:
+    """
+    Fetch OHLCV dari TradingView via WebSocket protocol.
+    Hanya butuh: websockets (pip install websockets)
+    """
+    import websockets.sync.client as wsc   # websockets>=12 sync API
+
+    full_sym  = f"{exchange}:{symbol}"
+    cs_token  = f"cs_{_tv_token()}"
+    qs_token  = f"qs_{_tv_token()}"
+
+    WS_URL = "wss://data.tradingview.com/socket.io/websocket"
+    HEADERS = {
+        "Origin": "https://www.tradingview.com",
+        "User-Agent": "Mozilla/5.0",
     }
-    return _map.get(tf_str, Interval.in_5_minute)
 
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize columns dan drop NaN."""
-    df = df.copy()
-    df.columns = [str(c[0]).capitalize() if isinstance(c, tuple) else str(c).capitalize()
-                  for c in df.columns]
-    # tvdatafeed returns lowercase; ensure standard capitalization
-    rename = {}
-    for c in df.columns:
-        low = c.lower()
-        if low == "open":   rename[c] = "Open"
-        elif low == "high": rename[c] = "High"
-        elif low == "low":  rename[c] = "Low"
-        elif low == "close":rename[c] = "Close"
-        elif low == "volume":rename[c]= "Volume"
-    df = df.rename(columns=rename)
+    candles = []
+
+    with wsc.connect(WS_URL, additional_headers=HEADERS, open_timeout=10) as ws:
+        # Handshake
+        ws.send(_tv_msg("set_auth_token", ["unauthorized_user_token"]))
+        ws.send(_tv_msg("chart_create_session", [cs_token, ""]))
+        ws.send(_tv_msg("quote_create_session", [qs_token]))
+        ws.send(_tv_msg("quote_set_fields", [qs_token,
+            "ch", "chp", "current_session", "description",
+            "local_description", "language", "exchange",
+            "fractional", "is_tradable", "lp", "lp_time",
+            "minmov", "minmov2", "original_name", "pricescale",
+            "pro_name", "short_name", "type", "update_mode", "volume",
+        ]))
+        ws.send(_tv_msg("quote_add_symbols",  [qs_token, full_sym]))
+        ws.send(_tv_msg("resolve_symbol", [cs_token, "sds_sym_1",
+            f'={{"symbol":"{full_sym}","adjustment":"splits"}}']))
+        ws.send(_tv_msg("create_series", [
+            cs_token, "sds_1", "s1", "sds_sym_1", interval, bars, ""
+        ]))
+
+        deadline = time.time() + 15   # max 15 detik tunggu data
+        while time.time() < deadline:
+            try:
+                raw = ws.recv(timeout=5)
+            except Exception:
+                break
+
+            # heartbeat
+            if "~h~" in raw:
+                ws.send(f"~m~{len(raw)}~m~{raw}")
+                continue
+
+            for msg in _tv_parse(raw):
+                m = msg.get("m", "")
+                if m == "timescale_update":
+                    bars_data = (msg.get("p", [{}])[1] or {}).get("sds_1", {}).get("s", [])
+                    for b in bars_data:
+                        v = b.get("v", [])
+                        if len(v) >= 5:
+                            candles.append({
+                                "ts":     v[0],
+                                "Open":   v[1],
+                                "High":   v[2],
+                                "Low":    v[3],
+                                "Close":  v[4],
+                                "Volume": v[5] if len(v) > 5 else 0,
+                            })
+                elif m == "series_completed":
+                    break   # done
+
+            if candles:
+                # brief wait for any remaining bars
+                if time.time() > deadline - 10:
+                    break
+
+    if not candles:
+        raise ValueError("No candles received from TradingView WS")
+
+    df = pd.DataFrame(candles)
+    df["Date"] = pd.to_datetime(df["ts"], unit="s", utc=True)
+    df = df.set_index("Date").drop(columns=["ts"])
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    return df
+
+# ==================================================
+# YAHOO FINANCE FALLBACK
+# ==================================================
+def _fetch_yf(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
+    import yfinance as yf
+    df = yf.download(yf_symbol, period=period, interval=interval,
+                     auto_adjust=True, progress=False)
+    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
     return df
 
-def _fetch_tv(exchange: str, symbol: str, tv_interval_str: str, bars: int) -> pd.DataFrame:
-    """Fetch dari TradingView via tvdatafeed."""
-    from tvdatafeed import TvDatafeed
-    iv = _tv_interval(tv_interval_str)
-    df = _tv_client.get_hist(symbol=symbol, exchange=exchange, interval=iv, n_bars=bars)
-    return _clean_df(df)
+# ==================================================
+# TV AVAILABLE CHECK  (lazy, once)
+# ==================================================
+_tv_ok: bool | None = None   # None = belum dicek
 
-def _fetch_yf(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
-    """Fallback: fetch dari Yahoo Finance."""
-    import yfinance as yf
-    df = yf.download(yf_symbol, period=period, interval=interval,
-                     auto_adjust=True, progress=False)
-    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-    return _clean_df(df)
+def _check_tv_available() -> bool:
+    global _tv_ok
+    if _tv_ok is not None:
+        return _tv_ok
+    try:
+        import websockets.sync.client  # noqa
+        _tv_ok = True
+        print("✅ TradingView WS: websockets tersedia")
+    except ImportError:
+        _tv_ok = False
+        print("⚠️  websockets tidak tersedia → Yahoo Finance only")
+    return _tv_ok
 
-# Simple in-memory cache {cache_key: (timestamp, df)}
+# ==================================================
+# IN-MEMORY CACHE
+# ==================================================
 _data_cache: dict = {}
-CACHE_TTL = 60   # detik — refresh data setiap 60 detik
+CACHE_TTL = 60   # detik
 
+def _cached(cache_key: str, ttl: int, fetch_fn):
+    now = time.time()
+    if cache_key in _data_cache:
+        ts, df = _data_cache[cache_key]
+        if now - ts < ttl:
+            return df
+    df = fetch_fn()
+    _data_cache[cache_key] = (now, df)
+    return df
+
+# ==================================================
+# PUBLIC DATA API
+# ==================================================
 def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
-    """
-    Fetch OHLCV data untuk satu pair + timeframe.
-    Urutan prioritas:
-      1. Cache (jika < CACHE_TTL detik)
-      2. TradingView (tvdatafeed)
-      3. Yahoo Finance (fallback)
-    """
     cfg       = TIMEFRAMES.get(timeframe, TIMEFRAMES[DEFAULT_TF])
     pair_info = PAIRS[pair_key]
     cache_key = f"{pair_key}_{timeframe}"
-    now       = time.time()
 
-    # ── Cache hit ────────────────────────────────
-    if cache_key in _data_cache:
-        ts, cached_df = _data_cache[cache_key]
-        if now - ts < CACHE_TTL:
-            return cached_df
+    def fetch():
+        df = None
+        if _check_tv_available():
+            try:
+                exchange, tv_sym = pair_info["tv"]
+                df = _fetch_tv_ws(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
+                print(f"[TV✅] {pair_key} {timeframe} {len(df)} bars")
+            except Exception as e:
+                print(f"[TV❌] {pair_key} {timeframe}: {e} → Yahoo")
+        if df is None or len(df) < 30:
+            df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
+        return df
 
-    # ── Try TradingView ──────────────────────────
-    df = None
-    if _init_tv():
-        try:
-            exchange, tv_sym = pair_info["tv"]
-            df = _fetch_tv(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
-        except Exception as e:
-            print(f"[TV] {pair_key} {timeframe} failed: {e} → Yahoo fallback")
-
-    # ── Yahoo fallback ───────────────────────────
-    if df is None or len(df) < 50:
-        df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
-
-    _data_cache[cache_key] = (now, df)
-    return df
+    return _cached(cache_key, CACHE_TTL, fetch)
 
 def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
-    """Fetch HTF data untuk MTF bias — sama flow TV+fallback."""
     cfg       = MTF_FETCH.get(tf, MTF_FETCH["1h"])
     pair_info = PAIRS[pair_key]
     cache_key = f"{pair_key}_{tf}_htf"
-    now       = time.time()
 
-    if cache_key in _data_cache:
-        ts, cached_df = _data_cache[cache_key]
-        if now - ts < CACHE_TTL * 5:   # HTF cache lebih lama
-            return cached_df
+    def fetch():
+        df = None
+        if _check_tv_available():
+            try:
+                exchange, tv_sym = pair_info["tv"]
+                df = _fetch_tv_ws(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
+            except Exception as e:
+                print(f"[TV HTF❌] {pair_key} {tf}: {e} → Yahoo")
+        if df is None or len(df) < 30:
+            df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
+        return df
 
-    df = None
-    if _init_tv():
-        try:
-            exchange, tv_sym = pair_info["tv"]
-            df = _fetch_tv(exchange, tv_sym, cfg["tv_interval"], cfg["bars"])
-        except Exception as e:
-            print(f"[TV HTF] {pair_key} {tf} failed: {e} → Yahoo fallback")
+    return _cached(cache_key, CACHE_TTL * 5, fetch)
 
-    if df is None or len(df) < 50:
-        df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
 
-    _data_cache[cache_key] = (now, df)
-    return df
 
 
 
@@ -1887,12 +1949,11 @@ async def divstatus_cmd(interaction: discord.Interaction):
 
 @client.tree.command(name="datasource", description="Cek status data source (TradingView / Yahoo)")
 async def datasource_cmd(interaction: discord.Interaction):
-    source = "🟢 **TradingView** (tvdatafeed)" if _tv_ok else "🟡 **Yahoo Finance** (fallback)"
+    _check_tv_available()
+    source     = "🟢 **TradingView WebSocket** (native)" if _tv_ok else "🟡 **Yahoo Finance** (fallback)"
     cache_info = f"Cache entries: `{len(_data_cache)}` | TTL: `{CACHE_TTL}s`"
-    cred_info  = "Credentials: " + ("✅ TV_USERNAME + TV_PASSWORD set" if TV_USERNAME else "⚠️ Anonymous (rate-limited)")
     await interaction.response.send_message(
-        f"**Data Source:** {source}\n{cred_info}\n{cache_info}",
-        ephemeral=True,
+        f"**Data Source:** {source}\n{cache_info}", ephemeral=True
     )
 
 # ==================================================
@@ -2351,9 +2412,9 @@ async def auto_signal_loop():
 @client.event
 async def on_ready():
     await client.tree.sync()
-    _init_tv()   # inisialisasi TV client di startup
+    _check_tv_available()
     print(f"✅ AI TRADING BOT READY — {client.user}")
-    print(f"   Data source: {'TradingView' if _tv_ok else 'Yahoo Finance (fallback)'}")
+    print(f"   Data source: {'TradingView WS' if _tv_ok else 'Yahoo Finance'}")
 
 # ==================================================
 # START
