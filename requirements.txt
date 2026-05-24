@@ -1,6 +1,8 @@
-discord.py==2.3.2
+discord.py>=2.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+yfinance>=0.2.30
 websockets>=12.0
-yfinance
-pandas
-numpy
-matplotlib
+psycopg2-binary>=2.9.0
+scikit-learn>=1.3.0
