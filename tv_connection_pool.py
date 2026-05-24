@@ -39,18 +39,22 @@ class TVConnectionPool:
     
     async def _create_connection(self, exchange: str, symbol: str, interval: str):
         import websockets
-        full_sym = f"{exchange}:{symbol}"
-        cs_token = f"cs_{self._tv_token()}"
-        qs_token = f"qs_{self._tv_token()}"
-        WS_URL = "wss://data.tradingview.com/socket.io/websocket"
-        ws = await websockets.connect(WS_URL)
-        await ws.send(self._tv_msg("set_auth_token", ["unauthorized_user_token"]))
-        await ws.send(self._tv_msg("chart_create_session", [cs_token, ""]))
-        await ws.send(self._tv_msg("quote_create_session", [qs_token]))
-        await ws.send(self._tv_msg("resolve_symbol", [cs_token, "sds_sym_1",
-            f'={{"symbol":"{full_sym}","adjustment":"splits"}}']))
-        await ws.send(self._tv_msg("create_series", [cs_token, "sds_1", "s1", "sds_sym_1", interval, 500, ""]))
+        headers = {
+        "Origin": "https://www.tradingview.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    try:
+        ws = await websockets.connect(
+            "wss://data.tradingview.com/socket.io/websocket",
+            extra_headers=headers,
+            open_timeout=10
+        )
         return ws
+    except Exception as e:
+        if "403" in str(e) and retry < 2:
+            await asyncio.sleep(5 * (retry + 1))
+            return await self._create_connection(exchange, symbol, interval, retry+1)
+        raise
     
     async def get_connection(self, exchange: str, symbol: str, interval: str):
         key = self._make_key(exchange, symbol, interval)
