@@ -2204,99 +2204,127 @@ def _rsi_div_detail(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) 
     }
 
 def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> discord.Embed:
-    """
-    Embed Discord khusus RSI Divergence notification.
-    Berisi keterangan lengkap divergence + ringkasan signal.
-    """
     is_bull  = div["type"] == "BULLISH_DIV"
     color    = discord.Color.green() if is_bull else discord.Color.red()
     emoji    = "🔼" if is_bull else "🔽"
     div_name = "BULLISH" if is_bull else "BEARISH"
 
-    # Kekuatan divergence
     strength = div["strength"]
-    if strength >= 15:   str_lbl = "🔥 STRONG"
-    elif strength >= 8:  str_lbl = "✅ MODERATE"
-    else:                str_lbl = "⚠️ WEAK"
+    if strength >= 15:   str_lbl = "STRONG"
+    elif strength >= 8:  str_lbl = "MODERATE"
+    else:                str_lbl = "WEAK"
+
+    # BOS + candle detail (injected dari check_and_send_div)
+    bos    = div.get("bos", {})
+    candle = div.get("candle", {})
+
+    bos_dir    = "Bull BOS" if bos.get("fresh_bull") else "Bear BOS"
+    bos_level  = bos.get("swing_high" if is_bull else "swing_low", 0)
+    candle_ok  = candle.get("confirmed", False)
+    candle_typ = candle.get("candle_type", "-")
+    body_pct   = candle.get("body_pct", 0)
+    vol_ok     = candle.get("vol_ok", False)
 
     embed = discord.Embed(
-        title       = f"{emoji} RSI {div_name} DIVERGENCE — {pair}",
+        title = f"{emoji} RSI {div_name} DIVERGENCE — {pair}  [{timeframe.upper()}]",
         description = (
-            f"**Timeframe:** `{timeframe.upper()}`\n"
-            f"**Kekuatan Divergence:** {str_lbl} (`{strength:.1f}` RSI pts)\n"
+            f"**Kekuatan:** `{str_lbl}` ({strength:.1f} RSI pts)  |  "
             f"**AI Score:** `{signal_data['score']}%` — {signal_data['confidence']}"
         ),
         color = color,
     )
 
-    # Penjelasan divergence
-    arrow_price = "⬇️" if div["price_diff"] < 0 else "⬆️"
-    arrow_rsi   = "⬆️" if div["rsi_diff"]   > 0 else "⬇️"
+    # ── Penjelasan divergence ─────────────────────
+    arrow_price = "↓" if div["price_diff"] < 0 else "↑"
+    arrow_rsi   = "↑" if div["rsi_diff"]   > 0 else "↓"
 
     if is_bull:
         explanation = (
-            "**Harga membuat Lower Low** tapi **RSI membuat Higher Low** →\n"
-            "Momentum bearish melemah. Potensi reversal ke atas.\n"
-            "Smart money kemungkinan **akumulasi** di level ini."
+            "Harga cetak **Lower Low** tapi RSI cetak **Higher Low**\n"
+            "→ Momentum bearish melemah, potensi reversal naik\n"
+            "→ Smart money kemungkinan **akumulasi** di area ini"
         )
     else:
         explanation = (
-            "**Harga membuat Higher High** tapi **RSI membuat Lower High** →\n"
-            "Momentum bullish melemah. Potensi reversal ke bawah.\n"
-            "Smart money kemungkinan **distribusi** di level ini."
+            "Harga cetak **Higher High** tapi RSI cetak **Lower High**\n"
+            "→ Momentum bullish melemah, potensi reversal turun\n"
+            "→ Smart money kemungkinan **distribusi** di area ini"
         )
 
-    embed.add_field(
-        name  = "📊 Analisis Divergence",
-        value = explanation,
-        inline=False,
-    )
+    embed.add_field(name="📊 Analisis Divergence", value=explanation, inline=False)
 
+    # ── RSI data ──────────────────────────────────
     embed.add_field(
         name  = "📈 Data RSI",
         value = (
-            f"Harga {lookback_label(div['lookback'])} lalu: `{div['price_prev']:.4f}` {arrow_price} `{div['price_now']:.4f}` (sekarang)\n"
-            f"RSI {lookback_label(div['lookback'])} lalu:    `{div['rsi_prev']:.2f}` {arrow_rsi} `{div['rsi_now']:.2f}` (sekarang)\n"
-            f"Selisih harga: `{div['price_diff']:+.4f}` | Selisih RSI: `{div['rsi_diff']:+.2f}`"
+            f"Harga  {div['lookback']}c lalu → sekarang: "
+            f"`{div['price_prev']:.4f}` {arrow_price} `{div['price_now']:.4f}`\n"
+            f"RSI    {div['lookback']}c lalu → sekarang: "
+            f"`{div['rsi_prev']:.2f}` {arrow_rsi} `{div['rsi_now']:.2f}`"
         ),
         inline=False,
     )
 
-    sw = signal_data["sweep"]
+    # ── BOS Konfirmasi ────────────────────────────
+    bos_status = "FRESH" if (bos.get("fresh_bull") if is_bull else bos.get("fresh_bear")) else "NOT CONFIRMED"
     embed.add_field(
-        name  = "📍 Level Trading",
+        name  = "🏗 BOS Konfirmasi",
         value = (
-            f"**Entry:** `{signal_data['entry']:.4f}`\n"
-            f"🟩 TP1: `{signal_data['tp1']:.4f}` (RR `1:{signal_data['rr1']:.2f}`)\n"
-            f"🎯 TP2: `{signal_data['tp2']:.4f}` (RR `1:{signal_data['rr2']:.2f}`)\n"
-            f"🟡 SL1: `{signal_data['sl1']:.4f}` (tight)\n"
-            f"🛡️ SL2: `{signal_data['sl2']:.4f}` (anti-sweep)"
+            f"Status: `{bos_dir}` — `{bos_status}`\n"
+            f"Level tembus: `{bos_level:.4f}`\n"
+            f"{'Break di atas swing high → struktur bullish terkonfirmasi' if is_bull else 'Break di bawah swing low → struktur bearish terkonfirmasi'}"
         ),
         inline=True,
     )
 
+    # ── Candle Konfirmasi ─────────────────────────
+    candle_status = "CONFIRMED" if candle_ok else "NOT CONFIRMED"
     embed.add_field(
-        name  = "🧠 Konfirmasi",
+        name  = "🕯 Candle Konfirmasi",
+        value = (
+            f"Status: `{candle_status}`\n"
+            f"Tipe: `{candle_typ}`  Body: `{body_pct*100:.0f}%`\n"
+            f"Volume: `{'Above avg' if vol_ok else 'Below avg'}`\n"
+            f"{'Close > mid candle sebelumnya' if is_bull else 'Close < mid candle sebelumnya'}"
+        ),
+        inline=True,
+    )
+
+    # ── Level Trading ─────────────────────────────
+    sw = signal_data["sweep"]
+    embed.add_field(
+        name  = "📍 Level Trading",
+        value = (
+            f"Entry: `{signal_data['entry']:.4f}`\n"
+            f"TP1: `{signal_data['tp1']:.4f}` (RR `1:{signal_data['rr1']:.2f}`)\n"
+            f"TP2: `{signal_data['tp2']:.4f}` (RR `1:{signal_data['rr2']:.2f}`)\n"
+            f"SL1: `{signal_data['sl1']:.4f}` tight\n"
+            f"SL2: `{signal_data['sl2']:.4f}` anti-sweep\n"
+            f"Pool ref: `{sw['sweep_ref']:.4f}`"
+        ),
+        inline=True,
+    )
+
+    # ── Konfirmasi tambahan ────────────────────────
+    embed.add_field(
+        name  = "🧠 Konfirmasi Lain",
         value = (
             f"MTF Bias: `{signal_data['mtf']['bias']}`\n"
             f"Orderflow: `{signal_data['orderflow']['bias']}`\n"
             f"FVG: `{'IN BULL FVG' if signal_data['fvg']['in_bull_fvg'] else 'IN BEAR FVG' if signal_data['fvg']['in_bear_fvg'] else 'Outside'}`\n"
-            f"Session: `{signal_data['session']['session']}`"
+            f"Session: `{signal_data['session']['session']}` {signal_data['session']['utc_time']}"
         ),
         inline=True,
     )
 
     embed.add_field(
         name  = "⚠️ Disclaimer",
-        value = (
-            "RSI Divergence adalah sinyal probabilistik, bukan kepastian.\n"
-            "Selalu gunakan manajemen risiko. Konfirmasi dengan price action."
-        ),
+        value = "RSI Divergence adalah sinyal probabilistik. Selalu gunakan manajemen risiko.",
         inline=False,
     )
 
     embed.set_footer(
-        text=f"🔔 Auto RSI Div Alert | TF: {timeframe.upper()} | AI Institutional Engine v3"
+        text=f"RSI Div Alert | TF: {timeframe.upper()} | Filter: BOS+Candle+Score>=65 | AI Engine v3"
     )
     return embed
 
@@ -2595,26 +2623,26 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
 async def div_scan_loop():
     """
     Scan RSI divergence semua pair — berjalan background.
+    Hanya TF >= 15m (15m, 1h, 4h) sesuai filter.
     Delay 3 menit setelah startup agar bot stabil dulu.
-    Setiap pair diproses sequential (bukan gather) agar
-    tidak flood TV rate limit sekaligus.
     """
     await client.wait_until_ready()
-    await asyncio.sleep(180)   # tunggu 3 menit setelah bot ready
+    await asyncio.sleep(180)
 
-    channel = client.get_channel(CHANNEL_ID)
+    channel  = client.get_channel(CHANNEL_ID)
+    div_tfs  = ["15m", "1h", "4h"]   # 5m excluded — noise terlalu tinggi
 
     while not client.is_closed():
         try:
             if channel:
                 for pair in PAIRS:
-                    for tf in ["5m", "15m", "1h"]:
+                    for tf in div_tfs:
                         await check_and_send_div(channel, pair, tf)
-                        await asyncio.sleep(1)   # beri napas event loop
+                        await asyncio.sleep(1)
         except Exception as e:
             print(f"[DIV LOOP ERROR] {e}")
 
-        await asyncio.sleep(300)   # scan berikutnya 5 menit kemudian
+        await asyncio.sleep(300)
 
 
 async def auto_signal_loop():
