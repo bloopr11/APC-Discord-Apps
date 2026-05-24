@@ -2095,68 +2095,6 @@ async def regime_cmd(interaction: discord.Interaction, pair: str, timeframe: str
         await interaction.followup.send(f"❌ Error: `{e}`")
 
 # ==================================================
-# [NEW] /dbstats
-# ==================================================
-@client.tree.command(name="dbstats", description="Statistik database & ML model")
-async def dbstats_cmd(interaction: discord.Interaction):
-    """Tampilkan statistik database dan status ML model."""
-    await interaction.response.defer(ephemeral=True)  # ← pakai defer biar tidak timeout
-    
-    try:
-        # Coba ambil statistik dari DB
-        stats = get_db_stats()
-        win_rate = get_win_rate()
-        ml_stat = ml_status()
-        
-        embed = discord.Embed(
-            title="📊 Database & ML Stats", 
-            color=discord.Color.blurple()
-        )
-        
-        # Cek apakah stats berhasil diambil
-        if stats:
-            embed.add_field(
-                name="🗃 Database",
-                value=(
-                    f"Signals logged: `{stats.get('signals', 0)}`\n"
-                    f"Div alerts:     `{stats.get('div_alerts', 0)}`\n"
-                    f"Score history:  `{stats.get('score_history', 0)}`\n"
-                    f"Outcomes:       `{stats.get('outcomes', 0)}`"
-                ),
-                inline=True,
-            )
-        else:
-            embed.add_field(name="🗃 Database", value="❌ Gagal mengambil statistik", inline=True)
-        
-        # Win rate
-        if win_rate and win_rate.get('total', 0) > 0:
-            embed.add_field(
-                name="🏆 Win Rate (from outcomes)",
-                value=(
-                    f"Total trades:  `{win_rate['total']}`\n"
-                    f"Wins:          `{win_rate['wins']}`\n"
-                    f"Losses:        `{win_rate['losses']}`\n"
-                    f"Win rate:      `{win_rate['win_rate']}%`"
-                ),
-                inline=True,
-            )
-        else:
-            embed.add_field(name="🏆 Win Rate", value="⏳ Belum ada data outcome", inline=True)
-        
-        # ML Status
-        embed.add_field(name="🤖 ML Model", value=ml_stat or "⏳ Belum siap", inline=False)
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        
-    except Exception as e:
-        # Tangkap error dan kirim pesan yang jelas
-        error_msg = f"❌ Error: `{str(e)}`"
-        print(f"[DBSTATS ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-        await interaction.followup.send(error_msg, ephemeral=True)
-
-# ==================================================
 # [NEW] /outcome
 # ==================================================
 @client.tree.command(name="outcome", description="Catat hasil trade (TP/SL hit)")
