@@ -37,47 +37,9 @@ TV_PASSWORD = os.getenv("TV_PASSWORD", "")
 # ==================================================
 # PAIRS config
 # ==================================================
-PAIRS = {
-    "BTCUSD":  {"tv": ("BINANCE",  "BTCUSDT"),  "yf": "BTC-USD"},
-    "ETHUSD":  {"tv": ("BINANCE",  "ETHUSDT"),  "yf": "ETH-USD"},
-    "XAUUSD":  {"tv": ("OANDA",    "XAUUSD"),   "yf": "GC=F"},
-    "XRPUSD":  {"tv": ("BINANCE",  "XRPUSDT"),  "yf": "XRP-USD"},
-    "SOLUSD":  {"tv": ("BINANCE",  "SOLUSDT"),  "yf": "SOL-USD"},
-    "ADAUSD":  {"tv": ("BINANCE",  "ADAUSDT"),  "yf": "ADA-USD"},
-    "DOGEUSD": {"tv": ("BINANCE",  "DOGEUSDT"), "yf": "DOGE-USD"},
-    "BNBUSD":  {"tv": ("BINANCE",  "BNBUSDT"),  "yf": "BNB-USD"},
-    "AVAXUSD": {"tv": ("BINANCE",  "AVAXUSDT"), "yf": "AVAX-USD"},
-    "LINKUSD": {"tv": ("BINANCE",  "LINKUSDT"), "yf": "LINK-USD"},
-    "BNBUSDT.P":  {"tv": ("BINANCE",  "BNBUSDT.P")},
-    "DOGEUSDT.P": {"tv": ("BINANCE",  "DOGEUSDT.P")},
-    "XRPUSDT.P":  {"tv": ("BINANCE",  "XRPUSDT.P")},
-    "ETHUSDT.P":  {"tv": ("BINANCE",  "ETHUSDT.P")},
-    "AVAXUSDT.P": {"tv": ("BINANCE",  "AVAXUSDT.P")},
-    "LINKUSDT": {"tv": ("BINANCE",  "LINKUSDT.P")},
-    "XRPUSDT.P":  {"tv": ("BINANCE",  "XRPUSDT.P")},
-    "SOLUSDT.P":  {"tv": ("BINANCE",  "SOLUSDT.P")},
-    "ADAUSDT.P":  {"tv": ("BINANCE",  "ADAUSDT.P")},
-    "BTCUSDT.P":  {"tv": ("BINANCE",  "BTCUSDT.P")},
-    "TURTLEUSDT.P":  {"tv": ("BINANCE",  "TURTLEUSDT.P")},
-    "XAGUSDT.P":  {"tv": ("BINANCE",  "XAGUSDT.P")},
-    "ZECUSDT.P":  {"tv": ("BINANCE",  "ZECUSDT.P")},
-}
+from pairs_config import PAIRS, TIMEFRAMES, MTF_FETCH, ASIA_ACTIVE, DEFAULT_TF
 
-TIMEFRAMES = {
-    "5m":  {"tv_interval": "5",    "yf_period": "5d",   "yf_interval": "5m",  "bars": 500},
-    "15m": {"tv_interval": "15",   "yf_period": "7d",   "yf_interval": "15m", "bars": 500},
-    "1h":  {"tv_interval": "60",   "yf_period": "30d",  "yf_interval": "1h",  "bars": 500},
-    "4h":  {"tv_interval": "240",  "yf_period": "60d",  "yf_interval": "4h",  "bars": 300},
-}
-
-MTF_FETCH = {
-    "1h":  {"tv_interval": "60",   "yf_period": "30d",  "yf_interval": "1h",  "bars": 300},
-    "4h":  {"tv_interval": "240",  "yf_period": "60d",  "yf_interval": "4h",  "bars": 200},
-    "1d":  {"tv_interval": "1D",   "yf_period": "180d", "yf_interval": "1d",  "bars": 200},
-    "1wk": {"tv_interval": "1W",   "yf_period": "730d", "yf_interval": "1wk", "bars": 100},
-}
-
-DEFAULT_TF     = "15m"
+DEFAULT TF = "15m"
 AUTO_SIGNAL    = False
 AUTO_MIN_SCORE = 75
 
@@ -1811,6 +1773,45 @@ async def scan_all_pairs_and_send(interaction, timeframe):
     embed.set_footer(text="Klik '📈 Signal per Pair' untuk detail sinyal per pair")
     await interaction.followup.send(embed=embed)
 
+# ==================================================
+# AUTOCOMPLETE FUNCTIONS
+# ==================================================
+
+async def autocomplete_pair(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Dropdown pair — filter by current input."""
+    return [
+        app_commands.Choice(name=p, value=p)
+        for p in PAIRS
+        if current.upper() in p
+    ][:25]  # Discord max 25 choices
+
+
+async def autocomplete_timeframe(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Dropdown timeframe."""
+    return [
+        app_commands.Choice(name=tf.upper(), value=tf)
+        for tf in TIMEFRAMES
+        if current.lower() in tf.lower()
+    ]
+
+
+async def autocomplete_outcome(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Dropdown outcome untuk /outcome command."""
+    options = ["TP1", "TP2", "SL1", "SL2", "MANUAL_CLOSE"]
+    return [
+        app_commands.Choice(name=o, value=o)
+        for o in options
+        if current.upper() in o
+    ]
 
 # ==================================================
 # SLASH COMMANDS
@@ -1819,7 +1820,7 @@ async def scan_all_pairs_and_send(interaction, timeframe):
 @client.tree.command(name="menu", description="Buka menu utama AI Trading Bot")
 async def menu(interaction: discord.Interaction):
     embed = discord.Embed(
-        title       = "🤖 APC-Institional Engine by Yor",
+        title       = "🤖 AI Institutional Trading Bot",
         description = "Pilih aksi yang ingin kamu lakukan:",
         color       = discord.Color.gold(),
     )
@@ -1830,9 +1831,9 @@ async def menu(interaction: discord.Interaction):
     embed.add_field(name="⚙️ Auto Signal Toggle", value="Aktifkan/matikan auto-signal otomatis",  inline=False)
     await interaction.response.send_message(embed=embed, view=MainMenuView())
 
-
 @client.tree.command(name="signal", description="Best AI signal dari semua pair")
-@app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
+@app_commands.describe(timeframe="Pilih timeframe")
+@app_commands.autocomplete(timeframe=autocomplete_timeframe)
 async def signal_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_TF):
     if timeframe not in TIMEFRAMES:
         await interaction.response.send_message(
@@ -1845,7 +1846,8 @@ async def signal_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_
 
 
 @client.tree.command(name="pair", description="Sinyal AI untuk pair tertentu")
-@app_commands.describe(pair="Contoh: BTCUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
+@app_commands.describe(pair="Pilih pair", timeframe="Pilih timeframe")
+@app_commands.autocomplete(pair=autocomplete_pair, timeframe=autocomplete_timeframe)
 async def pair_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
     pair = pair.upper()
     if pair not in PAIRS:
@@ -1863,7 +1865,8 @@ async def pair_cmd(interaction: discord.Interaction, pair: str, timeframe: str =
 
 
 @client.tree.command(name="chart", description="Candle chart pair tertentu")
-@app_commands.describe(pair="Contoh: ETHUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
+@app_commands.describe(pair="Pilih pair", timeframe="Pilih timeframe")
+@app_commands.autocomplete(pair=autocomplete_pair, timeframe=autocomplete_timeframe)
 async def chart_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
     pair = pair.upper()
     if pair not in PAIRS:
@@ -1876,7 +1879,8 @@ async def chart_cmd(interaction: discord.Interaction, pair: str, timeframe: str 
 
 
 @client.tree.command(name="scanall", description="Scan semua pair sekaligus")
-@app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
+@app_commands.describe(timeframe="Pilih timeframe")
+@app_commands.autocomplete(timeframe=autocomplete_timeframe)
 async def scanall_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_TF):
     await interaction.response.defer()
     await interaction.followup.send(f"⏳ Scanning semua pair `{timeframe.upper()}`...")
@@ -1896,8 +1900,8 @@ async def divstatus_cmd(interaction: discord.Interaction):
     now   = time.time()
     lines = []
     for pair in PAIRS:
-        for tf in ["5m", "15m", "1h"]:
-            key  = f"{pair}_{tf}"
+        for tf in ["15m", "1h", "4h"]:
+            key  = f"{pair}_{tf}_div"
             last = _div_sent.get(key)
             if last:
                 elapsed = int(now - last["ts"])
@@ -1919,13 +1923,176 @@ async def divstatus_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@client.tree.command(name="datasource", description="Cek status data source (TradingView / Yahoo)")
+@client.tree.command(name="datasource", description="Cek status data source")
 async def datasource_cmd(interaction: discord.Interaction):
     _check_tv_available()
-    source     = "🟢 **TradingView WebSocket** (native)" if _tv_ok else "🟡 **Yahoo Finance** (fallback)"
+    source     = "🟢 **TradingView WebSocket**" if _tv_ok else "🟡 **Yahoo Finance** (fallback)"
     cache_info = f"Cache entries: `{len(_data_cache)}` | TTL: `{CACHE_TTL}s`"
-    await interaction.response.send_message(f"**Data Source:** {source}\n{cache_info}", ephemeral=True)
+    await interaction.response.send_message(
+        f"**Data Source:** {source}\n{cache_info}", ephemeral=True
+    )
 
+
+@client.tree.command(name="dbstats", description="Statistik database & ML model")
+async def dbstats_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        stats    = get_db_stats()
+        win_rate = get_win_rate()
+        ml_stat  = ml_status()
+
+        embed = discord.Embed(title="📊 Database & ML Stats", color=discord.Color.blurple())
+
+        if stats:
+            embed.add_field(
+                name  = "🗃 Database",
+                value = (
+                    f"Signals logged: `{stats.get('signals', 0)}`\n"
+                    f"Div alerts:     `{stats.get('div_alerts', 0)}`\n"
+                    f"Score history:  `{stats.get('score_history', 0)}`\n"
+                    f"Outcomes:       `{stats.get('outcomes', 0)}`"
+                ),
+                inline=True,
+            )
+        else:
+            embed.add_field(name="🗃 Database", value="❌ Gagal mengambil statistik", inline=True)
+
+        if win_rate and win_rate.get("total", 0) > 0:
+            embed.add_field(
+                name  = "🏆 Win Rate",
+                value = (
+                    f"Total: `{win_rate['total']}`\n"
+                    f"Wins:  `{win_rate['wins']}`\n"
+                    f"Loss:  `{win_rate['losses']}`\n"
+                    f"Rate:  `{win_rate['win_rate']}%`"
+                ),
+                inline=True,
+            )
+        else:
+            embed.add_field(name="🏆 Win Rate", value="⏳ Belum ada data outcome", inline=True)
+
+        embed.add_field(name="🤖 ML Model", value=ml_stat or "⏳ Belum siap", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        print(f"[DBSTATS ERROR] {e}")
+        await interaction.followup.send(f"❌ Error: `{e}`", ephemeral=True)
+
+
+@client.tree.command(name="outcome", description="Catat hasil trade (TP/SL hit)")
+@app_commands.describe(
+    pair       = "Pilih pair",
+    timeframe  = "Pilih timeframe",
+    outcome    = "Pilih hasil trade",
+    entry      = "Harga entry",
+    exit_price = "Harga exit aktual",
+)
+@app_commands.autocomplete(
+    pair      = autocomplete_pair,
+    timeframe = autocomplete_timeframe,
+    outcome   = autocomplete_outcome,
+)
+async def outcome_cmd(
+    interaction: discord.Interaction,
+    pair:        str,
+    timeframe:   str,
+    outcome:     str,
+    entry:       float,
+    exit_price:  float,
+):
+    pair    = pair.upper()
+    outcome = outcome.upper()
+
+    valid_outcomes = {"TP1", "TP2", "SL1", "SL2", "MANUAL_CLOSE"}
+    if outcome not in valid_outcomes:
+        await interaction.response.send_message(
+            f"❌ Outcome tidak valid. Pilih: {', '.join(valid_outcomes)}", ephemeral=True
+        )
+        return
+
+    pips_result = exit_price - entry
+    recent      = get_recent_signals(pair, limit=5)
+    rr_achieved = 0.0
+    sl_used     = None
+    if recent:
+        last    = recent[0]
+        sl_used = last.get("sl2")
+        if sl_used and abs(entry - sl_used) > 0:
+            rr_achieved = abs(exit_price - entry) / abs(entry - sl_used)
+
+    log_outcome(
+        signal_id   = recent[0]["id"] if recent else 0,
+        pair        = pair,
+        timeframe   = timeframe,
+        action      = "BUY" if pips_result > 0 else "SELL",
+        entry       = entry,
+        tp1         = recent[0].get("tp1", 0) if recent else 0,
+        tp2         = recent[0].get("tp2", 0) if recent else 0,
+        sl1         = recent[0].get("sl1", 0) if recent else 0,
+        sl2         = recent[0].get("sl2", 0) if recent else 0,
+        outcome     = outcome,
+        pips_result = pips_result,
+        rr_achieved = round(rr_achieved, 2),
+    )
+
+    def _bg_train():
+        rows = get_training_data()
+        if len(rows) >= int(os.getenv("ML_MIN_ROWS", "150")):
+            train(rows)
+    threading.Thread(target=_bg_train, daemon=True).start()
+
+    emoji = "✅" if outcome in ("TP1", "TP2") else "❌"
+    await interaction.response.send_message(
+        f"{emoji} Outcome dicatat!\n"
+        f"**{pair}** `{timeframe}` | {outcome} | "
+        f"PnL: `{pips_result:+.4f}` | RR: `1:{rr_achieved:.2f}`",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="regime", description="Cek market regime pair saat ini")
+@app_commands.describe(pair="Pilih pair", timeframe="Pilih timeframe")
+@app_commands.autocomplete(pair=autocomplete_pair, timeframe=autocomplete_timeframe)
+async def regime_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
+    pair = pair.upper()
+    if pair not in PAIRS:
+        await interaction.response.send_message("❌ Pair tidak valid", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        df     = await run_blocking(get_data, pair, timeframe)
+        regime = detect_regime(df)
+
+        color_map = {
+            "TREND_UP":   discord.Color.green(),
+            "TREND_DOWN": discord.Color.red(),
+            "BREAKOUT":   discord.Color.orange(),
+            "REVERSAL":   discord.Color.purple(),
+            "RANGING":    discord.Color.greyple(),
+            "UNKNOWN":    discord.Color.default(),
+        }
+        embed = discord.Embed(
+            title = f"{regime['emoji']} Market Regime — {pair} {timeframe.upper()}",
+            color = color_map.get(regime["regime"], discord.Color.default()),
+        )
+        embed.add_field(name="📊 Regime Detail", value=regime_embed_value(regime), inline=False)
+        embed.add_field(
+            name  = "🔑 Alasan",
+            value = "\n".join(f"• {r}" for r in regime["reasons"]) or "N/A",
+            inline=False,
+        )
+        embed.add_field(
+            name  = "📐 Modifier",
+            value = (
+                f"BUY signal:  `{regime_score_modifier(regime, 'BUY'):+d}` pts\n"
+                f"SELL signal: `{regime_score_modifier(regime, 'SELL'):+d}` pts"
+            ),
+            inline=True,
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: `{e}`")
 
 # ==================================================
 # [NEW] /dbstats
