@@ -507,7 +507,17 @@ def get_training_data(min_rows: int = 200) -> list:
 def get_db_stats() -> dict:
     """Ringkasan isi database."""
     counts = {}
-    for table in ("signals", "div_alerts", "score_history", "outcomes"):
-        rows = _execute(f"SELECT COUNT(*) as n FROM {table}", fetch=True)
-        counts[table] = (rows[0]["n"] if rows else 0) or 0
+    tables = ["signals", "div_alerts", "score_history", "outcomes"]
+    
+    for table in tables:
+        try:
+            rows = _execute(f"SELECT COUNT(*) as n FROM {table}", fetch=True)
+            if rows and len(rows) > 0:
+                counts[table] = rows[0].get("n", 0) if isinstance(rows[0], dict) else rows[0][0]
+            else:
+                counts[table] = 0
+        except Exception as e:
+            print(f"[DB STATS] Gagal query {table}: {e}")
+            counts[table] = 0
+            
     return counts
