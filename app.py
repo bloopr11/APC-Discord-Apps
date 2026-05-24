@@ -51,7 +51,16 @@ PAIRS = {
     "BNBUSDT.P":  {"tv": ("BINANCE",  "BNBUSDT.P")},
     "DOGEUSDT.P": {"tv": ("BINANCE",  "DOGEUSDT.P")},
     "XRPUSDT.P":  {"tv": ("BINANCE",  "XRPUSDT.P")},
-    "ETHUSDT.P":  {"tv": ("BINANCE",  "ETHUSDT.P")}
+    "ETHUSDT.P":  {"tv": ("BINANCE",  "ETHUSDT.P")},
+    "AVAXUSDT.P": {"tv": ("BINANCE",  "AVAXUSDT.P")},
+    "LINKUSDT": {"tv": ("BINANCE",  "LINKUSDT.P")},
+    "XRPUSDT.P":  {"tv": ("BINANCE",  "XRPUSDT.P")},
+    "SOLUSDT.P":  {"tv": ("BINANCE",  "SOLUSDT.P")},
+    "ADAUSDT.P":  {"tv": ("BINANCE",  "ADAUSDT.P")},
+    "BTCUSDT.P":  {"tv": ("BINANCE",  "BTCUSDT.P")},
+    "TURTLEUSDT.P":  {"tv": ("BINANCE",  "TURTLEUSDT.P")},
+    "XAGUSDT.P":  {"tv": ("BINANCE",  "XAGUSDT.P")},
+    "ZECUSDT.P":  {"tv": ("BINANCE",  "ZECUSDT.P")},
 }
 
 TIMEFRAMES = {
