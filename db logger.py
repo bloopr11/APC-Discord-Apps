@@ -419,6 +419,7 @@ def log_outcome(
         tp1, tp2, sl1, sl2, outcome, pips_result, rr_achieved, bars_held,
     ))
 
+
 # ==================================================
 # QUERY HELPERS  (untuk analytics & ML)
 # ==================================================
