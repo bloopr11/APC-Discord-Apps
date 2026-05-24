@@ -48,6 +48,10 @@ PAIRS = {
     "BNBUSD":  {"tv": ("BINANCE",  "BNBUSDT"),  "yf": "BNB-USD"},
     "AVAXUSD": {"tv": ("BINANCE",  "AVAXUSDT"), "yf": "AVAX-USD"},
     "LINKUSD": {"tv": ("BINANCE",  "LINKUSDT"), "yf": "LINK-USD"},
+    "BNBUSDT.P":  {"tv": ("BINANCE",  "BNBUSDT.P")},
+    "DOGEUSDT.P": {"tv": ("BINANCE",  "DOGEUSDT.P")},
+    "XRPUSDT.P":  {"tv": ("BINANCE",  "XRPUSDT.P")},
+    "ETHUSDT.P":  {"tv": ("BINANCE",  "ETHUSDT.P")}
 }
 
 TIMEFRAMES = {
