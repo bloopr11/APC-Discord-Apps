@@ -294,3 +294,4 @@ def regime_embed_value(regime: dict) -> str:
         f"BBW: `{regime['bb_width']:.2f}%`  {bb_sq}\n"
         f"Strategy: `{regime['strategy']}`  {choch}"
     )
+
