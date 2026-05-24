@@ -187,27 +187,22 @@ def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
     return df
 
 def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
-    cfg = MTF_FETCH.get(tf, MTF_FETCH["1h"])
+   cfg = MTF_FETCH.get(tf, MTF_FETCH["1h"])
     pair_info = PAIRS[pair_key]
     cache_key = f"{pair_key}_{tf}_htf"
     if cache_key in _data_cache:
         ts, df = _data_cache[cache_key]
         if time.time() - ts < CACHE_TTL_HTF:
             return df
-    df = None
-    if _check_tv_available():
-        try:
-            _tv_throttle_sync()
-            df = fetch_tv_ws_sync(
-                pair_info["tv"][0], pair_info["tv"][1],
-                cfg["tv_interval"], cfg["bars"]
-            )
-        except Exception as e:
-            print(f"[TV HTF❌] {pair_key} {tf}: {e} → Yahoo")
-    if df is None or len(df) < 30:
-        df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
+    df = _fetch_yf(pair_info["yf"], cfg["yf_period"], cfg["yf_interval"])
     _data_cache[cache_key] = (time.time(), df)
     return df
+
+except Exception as e:
+    if "403" in str(e):
+        print(f"[TV HTF⚠️] {pair_key} {tf}: 403 Forbidden, skip TV")
+    else:
+        print(f"[TV HTF❌] {pair_key} {tf}: {e} → Yahoo")
 
 # ==================================================
 # DISCORD CLIENT
