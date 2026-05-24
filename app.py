@@ -77,7 +77,7 @@ MTF_FETCH = {
     "1wk": {"tv_interval": "1W",   "yf_period": "730d", "yf_interval": "1wk", "bars": 100},
 }
 
-DEFAULT_TF     = "5m"
+DEFAULT_TF     = "15m"
 AUTO_SIGNAL    = False
 AUTO_MIN_SCORE = 75
 
