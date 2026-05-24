@@ -368,3 +368,4 @@ def ml_embed_value(ml_result: dict) -> str:
 # STARTUP  — coba load model yang sudah ada
 # ==================================================
 load_model()
+
