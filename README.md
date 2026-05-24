@@ -1,4 +1,189 @@
-📌 APC Apps — Discord (by Yor)
+# 🚀 APC-Discord v4
+
+Advanced multi-factor trading signal engine for Discord using:
+- Smart Money Concept (SMC)
+- Multi Timeframe Bias
+- Orderflow Proxy
+- Fair Value Gap (FVG)
+- Adaptive AI Scoring
+- Regime Detection
+- Liquidity Sweep Protection
+- ML-based score optimization
+
+Supports:
+- Crypto
+- Gold (XAUUSD)
+- Futures pairs
+- Discord auto signals
+- TradingView WebSocket
+- Yahoo Finance fallback
+
+---
+
+# ✨ Features
+
+## 📊 Institutional Signal Engine
+- EMA trend stack
+- RSI divergence
+- MACD momentum
+- Stochastic filter
+- Bollinger positioning
+- ATR volatility
+
+---
+
+## 🧠 AI Adaptive Scoring
+Dynamic score engine with:
+- Rule-based scoring
+- ML adaptive weighting
+- Market regime adjustment
+- Confidence calculation
+- Confluence analysis
+
+---
+
+## 🏦 Smart Money Concept (SMC)
+Includes:
+- BOS detection
+- CHoCH
+- Order Block proxy
+- Liquidity zones
+- Liquidity pressure
+
+---
+
+## 📐 Fair Value Gap (FVG)
+- Bullish imbalance detection
+- Bearish imbalance detection
+- Nearest FVG mapping
+- FVG confluence scoring
+
+---
+
+## 🌍 Multi Timeframe Bias
+Automatic higher timeframe alignment:
+- 5m → 1h + 4h
+- 15m → 1h + 4h
+- 1h → 4h + 1D
+- 4h → 1D + 1W
+
+---
+
+## ⏰ Session Filter
+Session-aware trading:
+- Asia
+- London
+- New York
+- Overlap
+
+Special logic:
+- XAUUSD session optimization
+- Crypto Asia-session support
+
+---
+
+## 📦 Orderflow Proxy
+Estimated institutional pressure using:
+- Delta volume
+- CVD slope
+- Buy/sell volume ratio
+- Absorption detection
+
+---
+
+## 🛡 Anti Liquidity Sweep SL
+Advanced TP/SL system:
+- ATR-based stop
+- Liquidity pool avoidance
+- Anti-hunt stop placement
+- Multi-target RR
+
+---
+
+# 🤖 ML Retraining
+Built-in:
+- Signal logging
+- Score history
+- Outcome tracking
+- Adaptive retraining
+
+---
+
+# 📷 Discord Signal Example
+
+Signals include:
+- AI confidence score
+- TP1 / TP2
+- SL1 / SL2
+- RR ratio
+- Session info
+- MTF bias
+- Orderflow analysis
+- FVG zones
+- Market regime
+- Chart image
+
+---
+
+# 🧩 Supported Assets
+
+## Crypto
+- BTCUSD
+- ETHUSD
+- XRPUSD
+- SOLUSD
+- ADAUSD
+- DOGEUSD
+- AVAXUSD
+- LINKUSD
+- BNBUSD
+
+## Metals
+- XAUUSD
+- XAGUSD
+
+## Futures Perpetual
+- BTCUSDT.P
+- ETHUSDT.P
+- XRPUSDT.P
+- SOLUSDT.P
+- ADAUSDT.P
+- BNBUSDT.P
+- DOGEUSDT.P
+
+---
+
+# 📊 Signal Scoring System
+
+| Score | Confidence |
+|---|---|
+| 82+ | VERY HIGH |
+| 70+ | HIGH |
+| 55+ | MODERATE |
+| <55 | LOW |
+
+---
+
+# ⚠️ Disclaimer
+
+This project is an educational and analytical trading tool.
+
+Trading involves risk.  
+No guarantees of profitability are provided.
+
+Always use proper risk management.
+
+---
+
+
+# 👨‍💻 Author
+Bloopr11
+
+
+---
+
+
+📌 APC Apps — Discord (by Yor) v1
 
 Bot ini adalah AI-powered indikator assistant yang berjalan di Discord. Ia menggabungkan analisis teknikal, orderflow proxy, multi-timeframe confluence, serta rule-based scoring untuk menghasilkan sinyal trading otomatis dengan transparansi penuh.
 
