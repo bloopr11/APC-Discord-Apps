@@ -2217,14 +2217,18 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         inline=True,
     )
 
-    candle_status = "CONFIRMED" if candle_ok else "NOT CONFIRMED"
+    candle_status = "CONFIRMED" if candle_ok else ("DISABLED" if not candle else "NOT CONFIRMED")
     embed.add_field(
         name  = "🕯 Candle Konfirmasi",
         value = (
-            f"Status: `{candle_status}`\n"
-            f"Tipe: `{candle_typ}`  Body: `{body_pct*100:.0f}%`\n"
-            f"Volume: `{'Above avg' if vol_ok else 'Below avg'}`\n"
-            f"{'Close > mid candle sebelumnya' if is_bull else 'Close < mid candle sebelumnya'}"
+            "⚡ Dinonaktifkan — alert tanpa tunggu candle"
+            if not candle
+            else (
+                f"Status: `{candle_status}`\n"
+                f"Tipe: `{candle_typ}`  Body: `{body_pct*100:.0f}%`\n"
+                f"Volume: `{'Above avg' if vol_ok else 'Below avg'}`\n"
+                f"{'Close > mid candle sebelumnya' if is_bull else 'Close < mid candle sebelumnya'}"
+            )
         ),
         inline=True,
     )
@@ -2428,6 +2432,7 @@ def create_div_chart(df, pair, timeframe, div, signal_data) -> str:
 async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
     global _div_sent
 
+    # ── Filter 1: hanya 15m ke atas ───────────────
     if timeframe not in ("15m", "1h", "4h"):
         return
 
@@ -2437,9 +2442,11 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
         df       = data["df"]
         close    = df["Close"]
 
+        # ── Filter 2: divergence harus ada ────────
         if div_type == "NONE":
             return
 
+        # ── Filter 3: BOS konfirmasi ───────────────
         bos = bos_confirmation(df, swing=10)
         if div_type == "BULLISH_DIV":
             if not bos["fresh_bull"]:
@@ -2450,25 +2457,27 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
                 print(f"[DIV SKIP] {pair} {timeframe}: BEARISH_DIV tapi no fresh bear BOS")
                 return
 
-        candle = candle_confirmation(df, div_type)
-        if not candle["confirmed"]:
-            print(f"[DIV SKIP] {pair} {timeframe}: {div_type} candle not confirmed — {candle['desc']}")
-            return
+        # Filter 4 (candle konfirmasi) DINONAKTIFKAN
+        # Alert dikirim langsung tanpa menunggu candle konfirmasi
 
+        # ── Filter 5: AI score ────────────────────
         if data["score"] < 65:
             print(f"[DIV SKIP] {pair} {timeframe}: score {data['score']} < 65")
             return
 
+        # ── Filter 6: cooldown ────────────────────
         cache_key = f"{pair}_{timeframe}_div"
         now       = time.time()
         last      = _div_sent.get(cache_key, {})
         if last.get("type") == div_type and (now - last.get("ts", 0)) < DIV_COOLDOWN:
             return
 
+        # ── Semua filter lolos → kirim ────────────
         rsi_s   = rsi(close)
         div_det = _rsi_div_detail(df, rsi_s, lookback=5)
+
         div_det["bos"]    = bos
-        div_det["candle"] = candle
+        div_det["candle"] = {}   # candle konfirmasi dinonaktifkan
 
         embed = build_div_embed(pair, timeframe, div_det, data)
         path  = await run_blocking(create_div_chart, df, pair, timeframe, div_det, data)
@@ -2478,14 +2487,13 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
                 f"🔔 **RSI DIV ALERT** — `{pair}` `{timeframe.upper()}`\n"
                 f"{'🔼 BULLISH' if div_type == 'BULLISH_DIV' else '🔽 BEARISH'} | "
                 f"BOS: {'Fresh Bull' if bos['fresh_bull'] else 'Fresh Bear'} | "
-                f"Candle: {candle['candle_type']} | "
                 f"Score: `{data['score']:.1f}%` | {data['confidence']}"
             ),
             embed = embed,
             file  = discord.File(path),
         )
 
-        # [NEW] Log to DB
+        # Log to DB
         try:
             log_div_alert(pair, timeframe, div_det, data)
         except Exception as e:
