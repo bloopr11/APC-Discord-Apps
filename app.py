@@ -1293,7 +1293,7 @@ def build_embed(data: dict) -> discord.Embed:
         )
 
     embed.set_footer(
-        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | AI Institutional Engine v4"
+        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | APC-Institional Engine by Yor v4"
     )
     return embed
 
@@ -1531,7 +1531,7 @@ def create_chart(
         bbox=dict(facecolor="#161b22", edgecolor="#30363d", boxstyle="round,pad=0.4"),
     )
 
-    ax.text(0.5, 0.5, "AI INSTITUTIONAL BOT", transform=ax.transAxes,
+    ax.text(0.5, 0.5, "APC-Institional Engine by Yor", transform=ax.transAxes,
             fontsize=30, color="white", alpha=0.03,
             ha="center", va="center", rotation=30, fontweight="bold")
 
@@ -1819,7 +1819,7 @@ async def scan_all_pairs_and_send(interaction, timeframe):
 @client.tree.command(name="menu", description="Buka menu utama AI Trading Bot")
 async def menu(interaction: discord.Interaction):
     embed = discord.Embed(
-        title       = "🤖 AI Institutional Trading Bot",
+        title       = "🤖 APC-Institional Engine by Yor",
         description = "Pilih aksi yang ingin kamu lakukan:",
         color       = discord.Color.gold(),
     )
@@ -2416,7 +2416,7 @@ def create_div_chart(df, pair, timeframe, div, signal_data) -> str:
         f"RSI {div_lbl}  ·  {pair}  ·  {timeframe.upper()}  ·  Score {signal_data['score']:.1f}%",
         color=div_color, fontsize=13, fontweight="bold", y=0.97,
     )
-    ax_c.text(0.5, 0.5, "AI INSTITUTIONAL BOT", transform=ax_c.transAxes,
+    ax_c.text(0.5, 0.5, "APC-Institional Engine by Yor", transform=ax_c.transAxes,
               fontsize=28, color="white", alpha=0.03, ha="center", va="center", rotation=30, fontweight="bold")
 
     filename = f"{pair}_div_chart.png"
