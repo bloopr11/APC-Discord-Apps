@@ -419,6 +419,7 @@ def log_outcome(
         tp1, tp2, sl1, sl2, outcome, pips_result, rr_achieved, bars_held,
     ))
 
+
 # ==================================================
 # QUERY HELPERS  (untuk analytics & ML)
 # ==================================================
@@ -465,27 +466,58 @@ def get_training_data(min_rows: int = 200) -> list:
     """
     Ambil data gabungan signals + outcomes untuk ML training.
     Hanya baris yang sudah ada outcome-nya.
+    
+    [FIX] Menangani perbedaan tipe data:
+    - PostgreSQL: ts (BIGINT) vs created_at (TIMESTAMP) → konversi timestamp ke epoch
+    - SQLite: ts (INTEGER) vs created_at (TEXT) → gunakan strftime
     """
-    sql = """
-        SELECT
-            s.score, s.cat_trend, s.cat_momentum, s.cat_smc,
-            s.cat_orderflow, s.cat_fvg, s.cat_mtf, s.cat_session,
-            s.adx, s.rsi, s.vol_ratio, s.action,
-            o.outcome, o.rr_achieved, o.bars_held
-        FROM score_history s
-        JOIN outcomes o ON s.pair = o.pair
-            AND s.timeframe = o.timeframe
-            AND ABS(s.ts - o.created_at) < 3600
-        ORDER BY s.ts DESC
-        LIMIT %s
-    """
+    if USE_POSTGRES:
+        # PostgreSQL: konversi TIMESTAMP ke epoch (detik)
+        sql = """
+            SELECT
+                s.score, s.cat_trend, s.cat_momentum, s.cat_smc,
+                s.cat_orderflow, s.cat_fvg, s.cat_mtf, s.cat_session,
+                s.adx, s.rsi, s.vol_ratio, s.action,
+                o.outcome, o.rr_achieved, o.bars_held
+            FROM score_history s
+            JOIN outcomes o ON s.pair = o.pair
+                AND s.timeframe = o.timeframe
+                AND ABS(s.ts - EXTRACT(EPOCH FROM o.created_at)::BIGINT) < 3600
+            ORDER BY s.ts DESC
+            LIMIT %s
+        """
+    else:
+        # SQLite: strftime('%s', date) → epoch
+        sql = """
+            SELECT
+                s.score, s.cat_trend, s.cat_momentum, s.cat_smc,
+                s.cat_orderflow, s.cat_fvg, s.cat_mtf, s.cat_session,
+                s.adx, s.rsi, s.vol_ratio, s.action,
+                o.outcome, o.rr_achieved, o.bars_held
+            FROM score_history s
+            JOIN outcomes o ON s.pair = o.pair
+                AND s.timeframe = o.timeframe
+                AND ABS(s.ts - CAST(strftime('%%s', o.created_at) AS INTEGER)) < 3600
+            ORDER BY s.ts DESC
+            LIMIT %s
+        """
     rows = _execute(sql, (min_rows * 2,), fetch=True) or []
     return rows
 
 def get_db_stats() -> dict:
     """Ringkasan isi database."""
     counts = {}
-    for table in ("signals", "div_alerts", "score_history", "outcomes"):
-        rows = _execute(f"SELECT COUNT(*) as n FROM {table}", fetch=True)
-        counts[table] = (rows[0]["n"] if rows else 0) or 0
+    tables = ["signals", "div_alerts", "score_history", "outcomes"]
+    
+    for table in tables:
+        try:
+            rows = _execute(f"SELECT COUNT(*) as n FROM {table}", fetch=True)
+            if rows and len(rows) > 0:
+                counts[table] = rows[0].get("n", 0) if isinstance(rows[0], dict) else rows[0][0]
+            else:
+                counts[table] = 0
+        except Exception as e:
+            print(f"[DB STATS] Gagal query {table}: {e}")
+            counts[table] = 0
+            
     return counts

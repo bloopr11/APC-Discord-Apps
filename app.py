@@ -13,6 +13,20 @@ import matplotlib
 matplotlib.use("Agg")
 
 # ==================================================
+# NEW MODULE IMPORTS  (db_logger, regime, ml_scorer)
+# ==================================================
+from db_logger  import (
+    init_db, log_signal, log_score_history, log_div_alert,
+    log_outcome, get_recent_signals, get_win_rate, get_db_stats,
+    get_training_data,
+)
+from regime     import detect_regime, regime_score_modifier, should_skip, regime_embed_value
+from ml_scorer  import (
+    adaptive_score, maybe_retrain, ml_status, ml_embed_value,
+    train, load_model, _model_meta,
+)
+
+# ==================================================
 # ENV
 # ==================================================
 TOKEN      = os.getenv("DISCORD_TOKEN")
@@ -55,23 +69,18 @@ AUTO_SIGNAL    = False
 AUTO_MIN_SCORE = 75
 
 # ==================================================
-# TRADINGVIEW WEBSOCKET  — self-contained, no tvdatafeed
-# Uses only: websockets (PyPI), json, re (stdlib)
-# Protocol reverse-engineered from TradingView browser WS
+# TRADINGVIEW WEBSOCKET
 # ==================================================
 import json, re, random, string
 
 def _tv_token() -> str:
-    """Generate random session token like TradingView browser."""
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
 
 def _tv_msg(func: str, args: list) -> str:
-    """Encode a TradingView WebSocket protocol message."""
     payload = json.dumps({"m": func, "p": args}, separators=(",", ":"))
     return f"~m~{len(payload)}~m~{payload}"
 
 def _tv_parse(raw: str) -> list:
-    """Parse raw TV WS frames into list of message dicts."""
     msgs = []
     for chunk in re.findall(r"~m~\d+~m~(.+?)(?=~m~\d+~m~|$)", raw, re.DOTALL):
         chunk = chunk.strip()
@@ -84,10 +93,6 @@ def _tv_parse(raw: str) -> list:
     return msgs
 
 def _fetch_tv_ws(exchange: str, symbol: str, interval: str, bars: int) -> pd.DataFrame:
-    """
-    Fetch OHLCV dari TradingView via WebSocket.
-    Satu koneksi per request, dengan retry jika 429.
-    """
     import websockets.sync.client as wsc
 
     full_sym  = f"{exchange}:{symbol}"
@@ -124,7 +129,6 @@ def _fetch_tv_ws(exchange: str, symbol: str, interval: str, bars: int) -> pd.Dat
                 except Exception:
                     break
 
-                # heartbeat reply
                 if "~h~" in raw:
                     ws.send(f"~m~{len(raw)}~m~{raw}")
                     continue
@@ -182,7 +186,7 @@ def _fetch_yf(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
     return df
 
 # ==================================================
-# TV AVAILABLE CHECK  (lazy, once)
+# TV AVAILABLE CHECK
 # ==================================================
 _tv_ok: bool | None = None
 
@@ -200,27 +204,18 @@ def _check_tv_available() -> bool:
     return _tv_ok
 
 # ==================================================
-# TV RATE LIMIT — threading.Lock + dedicated executor
-# Pakai ThreadPoolExecutor terpisah untuk TV calls
-# agar tidak memblokir Discord interaction thread pool
+# TV RATE LIMIT
 # ==================================================
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 _tv_lock       = threading.Lock()
 _tv_last_call  = 0.0
-TV_MIN_INTERVAL = 3.0   # 3 detik cukup untuk anonymous TV
+TV_MIN_INTERVAL = 3.0
 
-# Executor khusus TV — max 1 worker = benar-benar sequential
 _tv_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tv_fetch")
 
 def _tv_throttle_sync():
-    """
-    Acquire lock → tunggu jeda min → lanjut fetch.
-    Karena _tv_executor max_workers=1, hanya 1 call
-    yang bisa jalan sekaligus tanpa perlu lock tambahan.
-    Tapi lock tetap ada sebagai safety net.
-    """
     global _tv_last_call
     with _tv_lock:
         elapsed = time.time() - _tv_last_call
@@ -229,25 +224,20 @@ def _tv_throttle_sync():
         _tv_last_call = time.time()
 
 async def run_tv_blocking(func, *args, **kwargs):
-    """
-    Jalankan TV fetch di _tv_executor yang dedicated —
-    tidak berbagi thread pool dengan Discord interactions.
-    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         _tv_executor, functools.partial(func, *args, **kwargs)
     )
 
 def _get_tv_semaphore():
-    """Kept for compatibility — no-op."""
     return asyncio.Semaphore(999)
 
 # ==================================================
 # IN-MEMORY CACHE
 # ==================================================
 _data_cache: dict = {}
-CACHE_TTL     = 180    # 3 menit — cukup fresh
-CACHE_TTL_HTF = 1800   # 30 menit — HTF (1h, 4h, 1d)
+CACHE_TTL     = 180
+CACHE_TTL_HTF = 1800
 
 def _cache_get(cache_key: str, ttl: int):
     now = time.time()
@@ -261,7 +251,7 @@ def _cache_set(cache_key: str, df):
     _data_cache[cache_key] = (time.time(), df)
 
 # ==================================================
-# PUBLIC DATA API  (async — pakai TV executor)
+# PUBLIC DATA API
 # ==================================================
 def get_data(pair_key: str, timeframe: str = DEFAULT_TF) -> pd.DataFrame:
     cfg       = TIMEFRAMES.get(timeframe, TIMEFRAMES[DEFAULT_TF])
@@ -321,13 +311,8 @@ def get_htf_data(pair_key: str, tf: str) -> pd.DataFrame:
     return df
 
 def _fetch_with_throttle(exchange: str, symbol: str, interval: str, bars: int) -> pd.DataFrame:
-    """Throttle + fetch — dijalankan di _tv_executor (1 worker)."""
     _tv_throttle_sync()
     return _fetch_tv_ws(exchange, symbol, interval, bars)
-
-
-
-
 
 # ==================================================
 # DISCORD CLIENT
@@ -400,17 +385,9 @@ def volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
     return float(cur_vol / avg_vol) if avg_vol else 1.0
 
 # ==================================================
-# ① DELTA VOLUME PROXY  (real orderflow approximation)
+# ① DELTA VOLUME PROXY
 # ==================================================
 def delta_orderflow(df: pd.DataFrame, period: int = 20) -> dict:
-    """
-    Delta = bullish_volume - bearish_volume per candle.
-    Bullish candle  → volume counts as buying pressure (+)
-    Bearish candle  → volume counts as selling pressure (-)
-
-    Cumulative delta trend tells us who is in control.
-    CVD slope (last N bars) = orderflow bias direction.
-    """
     if "Volume" not in df.columns or df["Volume"].sum() == 0:
         return {
             "delta":        0.0,
@@ -424,14 +401,10 @@ def delta_orderflow(df: pd.DataFrame, period: int = 20) -> dict:
     open_  = df["Open"]
     vol    = df["Volume"]
 
-    # signed delta per candle
     direction     = np.where(close >= open_, 1.0, -1.0)
     signed_vol    = vol * direction
-
-    # cumulative volume delta
     cvd           = signed_vol.cumsum()
 
-    # slope of CVD over last `period` bars → trend of orderflow
     cvd_tail      = cvd.iloc[-period:]
     x             = np.arange(len(cvd_tail))
     if len(x) > 1:
@@ -439,15 +412,12 @@ def delta_orderflow(df: pd.DataFrame, period: int = 20) -> dict:
     else:
         slope = 0.0
 
-    # last bar delta
     last_delta    = float(signed_vol.iloc[-1])
 
-    # buy volume % of total (last period)
     buy_vol       = vol[direction == 1.0].iloc[-period:].sum()
     total_vol     = vol.iloc[-period:].sum()
     buy_pct       = float(buy_vol / total_vol * 100) if total_vol > 0 else 50.0
 
-    # absorption: price barely moved but high volume → smart money absorbing
     price_range   = float((close - open_).abs().iloc[-3:].mean())
     vol_mean      = float(vol.rolling(20).mean().iloc[-1]) or 1
     absorption    = (float(vol.iloc[-1]) > 1.5 * vol_mean) and (price_range < float(atr(df).iloc[-1]) * 0.3)
@@ -460,39 +430,29 @@ def delta_orderflow(df: pd.DataFrame, period: int = 20) -> dict:
         "bias":        bias,
         "buy_vol_pct": buy_pct,
         "absorption":  absorption,
-        "cvd":         cvd,           # full series for chart
+        "cvd":         cvd,
     }
 
 # ==================================================
-# ② FVG ENGINE  (Fair Value Gap / Imbalance)
+# ② FVG ENGINE
 # ==================================================
 def fvg_engine(df: pd.DataFrame, lookback: int = 50) -> dict:
-    """
-    Bullish FVG: candle[i-2].high < candle[i].low  → gap that price may fill
-    Bearish FVG: candle[i-2].low  > candle[i].high → gap that price may fill
-
-    Returns list of active FVGs (not yet filled) and whether price is
-    currently inside one (high-probability zone).
-    """
     highs  = df["High"].values
     lows   = df["Low"].values
     closes = df["Close"].values
     n      = len(df)
 
-    bull_fvgs = []   # (top, bottom, bar_idx)
+    bull_fvgs = []
     bear_fvgs = []
 
     start = max(2, n - lookback)
     for i in range(start, n - 1):
-        # Bullish FVG
         if lows[i] > highs[i - 2]:
             top    = lows[i]
             bottom = highs[i - 2]
-            # check if still unfilled (current price hasn't closed inside gap)
             if closes[-1] > bottom:
                 bull_fvgs.append({"top": top, "bottom": bottom, "idx": i})
 
-        # Bearish FVG
         if highs[i] < lows[i - 2]:
             top    = lows[i - 2]
             bottom = highs[i]
@@ -501,12 +461,9 @@ def fvg_engine(df: pd.DataFrame, lookback: int = 50) -> dict:
 
     price = closes[-1]
 
-    # Is price inside a bullish FVG? → high-probability BUY zone
     in_bull_fvg = any(f["bottom"] <= price <= f["top"] for f in bull_fvgs)
-    # Is price inside a bearish FVG? → high-probability SELL zone
     in_bear_fvg = any(f["bottom"] <= price <= f["top"] for f in bear_fvgs)
 
-    # Nearest FVG levels (for chart)
     nearest_bull = bull_fvgs[-1] if bull_fvgs else None
     nearest_bear = bear_fvgs[-1] if bear_fvgs else None
 
@@ -522,7 +479,7 @@ def fvg_engine(df: pd.DataFrame, lookback: int = 50) -> dict:
     }
 
 # ==================================================
-# ③ MTF BIAS  (Multi-Timeframe Confluence)
+# ③ MTF BIAS
 # ==================================================
 MTF_MAP = {
     "5m":  ["1h",  "4h"],
@@ -532,15 +489,6 @@ MTF_MAP = {
 }
 
 def mtf_bias(pair_key: str, base_tf: str) -> dict:
-    """
-    Fetch 2 higher timeframes and compute bias for each.
-    Bias per TF = weighted sum of:
-      - EMA stack (8/21/50 alignment)
-      - RSI position (>55 bull, <45 bear)
-      - MACD histogram sign
-      - Price vs 200 EMA
-    Returns combined bias score (-100 to +100) and per-TF detail.
-    """
     htf_list = MTF_MAP.get(base_tf, ["1h", "4h"])
     results  = {}
     total_score = 0
@@ -561,21 +509,17 @@ def mtf_bias(pair_key: str, base_tf: str) -> dict:
             macd_v = float(mh.iloc[-1])
 
             s = 0
-            # EMA stack
             if price > e8 > e21 > e50:   s += 40
             elif price < e8 < e21 < e50: s -= 40
             elif price > e21:            s += 20
             elif price < e21:            s -= 20
 
-            # Price vs 200 EMA
             if price > e200:  s += 20
             else:             s -= 20
 
-            # RSI
             if rsi_v > 55:   s += 20
             elif rsi_v < 45: s -= 20
 
-            # MACD hist
             if macd_v > 0:   s += 20
             else:             s -= 20
 
@@ -610,21 +554,18 @@ SESSIONS = {
     "OVERLAP": {"start": dt.time(12, 0), "end": dt.time(15, 59), "color": "#fff176"},
 }
 
-# Score bonus / penalty per session (volatility & liquidity weight)
 SESSION_SCORE = {
-    "OVERLAP":  15,   # London + NY overlap — highest liquidity
+    "OVERLAP":  15,
     "LONDON":   10,
     "NEW_YORK":  8,
-    "ASIA":      0,   # low volatility for most pairs
-    "OFF":      -10,  # outside all sessions
+    "ASIA":      0,
+    "OFF":      -10,
 }
 
-# Pairs that are active in ASIA session
 ASIA_ACTIVE = {"BTCUSD", "ETHUSD", "BNBUSD", "ADAUSD", "XRPUSD",
                "SOLUSD", "DOGEUSD", "AVAXUSD", "LINKUSD"}
 
 def session_filter(pair: str) -> dict:
-    """Return current session, score modifier, and whether to trade."""
     now_utc  = dt.datetime.now(dt.timezone.utc).time()
     active   = []
 
@@ -633,7 +574,6 @@ def session_filter(pair: str) -> dict:
         if s <= now_utc <= e:
             active.append(name)
 
-    # determine dominant session
     if "OVERLAP" in active:
         session = "OVERLAP"
     elif "LONDON" in active and "NEW_YORK" not in active:
@@ -647,11 +587,9 @@ def session_filter(pair: str) -> dict:
 
     score_mod = SESSION_SCORE.get(session, 0)
 
-    # XAUUSD is best traded London/NY/Overlap only
     if pair == "XAUUSD" and session in ("ASIA", "OFF"):
         score_mod -= 15
 
-    # Crypto pairs are 24/7 — no penalty for ASIA
     if pair in ASIA_ACTIVE and session == "ASIA":
         score_mod = max(score_mod, 0)
 
@@ -676,20 +614,9 @@ def rsi_divergence(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) -
     return "NONE"
 
 # ==================================================
-# BOS CONFIRMATION  (untuk div alert)
-# Lebih ketat dari smc() biasa — perlu breakout
-# yang terkonfirmasi candle close, bukan hanya wick
+# BOS CONFIRMATION
 # ==================================================
 def bos_confirmation(df: pd.DataFrame, swing: int = 10) -> dict:
-    """
-    Bullish BOS : close[-1] > swing high N bars sebelumnya
-                  DAN close[-1] > close[-2]  (candle naik)
-    Bearish BOS : close[-1] < swing low  N bars sebelumnya
-                  DAN close[-1] < close[-2]  (candle turun)
-
-    Juga deteksi apakah BOS baru terjadi (di 3 candle terakhir)
-    untuk membedakan BOS lama vs fresh BOS.
-    """
     high  = df["High"]
     low   = df["Low"]
     close = df["Close"]
@@ -697,18 +624,15 @@ def bos_confirmation(df: pd.DataFrame, swing: int = 10) -> dict:
     swing_high = high.rolling(swing).max()
     swing_low  = low.rolling(swing).min()
 
-    # BOS bullish — close tembus swing high sebelumnya
     bull_bos = (
         close.iloc[-1] > swing_high.iloc[-swing - 1]
         and close.iloc[-1] > close.iloc[-2]
     )
-    # BOS bearish — close tembus swing low sebelumnya
     bear_bos = (
         close.iloc[-1] < swing_low.iloc[-swing - 1]
         and close.iloc[-1] < close.iloc[-2]
     )
 
-    # Freshness — apakah BOS terjadi dalam 3 candle terakhir
     fresh_bull = any(
         close.iloc[-i] > swing_high.iloc[-swing - i]
         for i in range(1, 4)
@@ -728,21 +652,9 @@ def bos_confirmation(df: pd.DataFrame, swing: int = 10) -> dict:
     }
 
 # ==================================================
-# CANDLE TREND CONFIRMATION  (untuk div alert)
-# Konfirmasi momentum candle mendukung reversal
+# CANDLE TREND CONFIRMATION
 # ==================================================
 def candle_confirmation(df: pd.DataFrame, div_type: str) -> dict:
-    """
-    Bullish div  → cari candle konfirmasi bullish:
-      - Candle terakhir bullish (close > open)
-      - Body > 50% dari range (tidak ekor panjang)
-      - Close di atas midpoint candle sebelumnya (engulfing partial)
-      - Volume di atas rata-rata (jika tersedia)
-
-    Bearish div  → kebalikannya.
-
-    Returns konfirmasi dan detail untuk embed.
-    """
     open_  = df["Open"]
     high   = df["High"]
     low    = df["Low"]
@@ -754,7 +666,7 @@ def candle_confirmation(df: pd.DataFrame, div_type: str) -> dict:
 
     body1     = abs(c1 - o1)
     range1    = h1 - l1 if h1 != l1 else 0.0001
-    body_pct  = body1 / range1   # >0.5 = solid candle
+    body_pct  = body1 / range1
 
     mid_prev  = (o2 + c2) / 2
 
@@ -763,9 +675,9 @@ def candle_confirmation(df: pd.DataFrame, div_type: str) -> dict:
     vol_ok    = cur_vol > avg_vol * 0.9 if avg_vol > 0 else True
 
     if div_type == "BULLISH_DIV":
-        bull_candle  = c1 > o1                  # candle hijau
-        solid        = body_pct > 0.45           # body cukup solid
-        above_mid    = c1 > mid_prev             # close di atas mid prev
+        bull_candle  = c1 > o1
+        solid        = body_pct > 0.45
+        above_mid    = c1 > mid_prev
         confirmed    = bull_candle and solid and above_mid
         candle_type  = "Bullish" if bull_candle else "Bearish"
         desc = (
@@ -845,13 +757,9 @@ def flow(df: pd.DataFrame) -> dict:
     return {"FLOW": "BUY" if momentum > 0 else "SELL", "STRENGTH": abs(momentum) * 100}
 
 # ==================================================
-# TREND STRENGTH  (ADX proxy)
+# TREND STRENGTH
 # ==================================================
 def trend_strength(df: pd.DataFrame, period: int = 14) -> dict:
-    """
-    Simplified ADX-like strength using directional movement.
-    +DM / -DM ratio → trend conviction score 0-100
-    """
     high  = df["High"]
     low   = df["Low"]
     close = df["Close"]
@@ -885,7 +793,7 @@ def trend_strength(df: pd.DataFrame, period: int = 14) -> dict:
     }
 
 # ==================================================
-# LSTM PROXY (multi-EMA weighted bias)
+# LSTM PROXY
 # ==================================================
 def lstm_prediction(df: pd.DataFrame) -> str:
     close  = df["Close"]
@@ -898,25 +806,15 @@ def lstm_prediction(df: pd.DataFrame) -> str:
     return "BULLISH" if score >= 2 else "BEARISH"
 
 # ==================================================
-# ⑤ ADVANCED RULE-BASED SCORING  (replaces ai_score)
+# ⑤ ADVANCED RULE-BASED SCORING
 # ==================================================
 def advanced_score(
     lstm, smc_data, liq, fl, rsi_val, macd_hist, ema_conf,
     rsi_div, vol_ratio, stoch_k_val, bb_pos,
-    # new engines
-    of: dict,       # orderflow delta
-    fvg: dict,      # fair value gap
-    mtf: dict,      # multi-timeframe bias
-    sess: dict,     # session filter
-    trend: dict,    # trend strength
+    of: dict, fvg: dict, mtf: dict, sess: dict, trend: dict,
 ) -> dict:
-    """
-    Scores 0-100 with per-category breakdown for transparency.
-    Returns dict with total score and sub-scores.
-    """
-    cats = {}   # category breakdown
+    cats = {}
 
-    # ── 1. TREND STRUCTURE (max 25) ───────────────
     t = 0
     if lstm == "BULLISH":           t += 10
     else:                           t -= 10
@@ -927,7 +825,6 @@ def advanced_score(
         t += 4 if trend["bull_trend"] else -4
     cats["TREND"] = max(-25, min(25, t))
 
-    # ── 2. MOMENTUM (max 20) ──────────────────────
     m = 0
     if rsi_val < 30:         m += 10
     elif rsi_val > 70:       m -= 10
@@ -941,7 +838,6 @@ def advanced_score(
     elif stoch_k_val > 80:   m -= 4
     cats["MOMENTUM"] = max(-20, min(20, m))
 
-    # ── 3. SMC / STRUCTURE (max 20) ───────────────
     s = 0
     if smc_data["BOS"]:          s += 8
     if smc_data["LIQ"]:          s += 5
@@ -953,47 +849,38 @@ def advanced_score(
     else:                         s -= 3
     cats["SMC"] = max(-20, min(20, s))
 
-    # ── 4. ORDERFLOW DELTA (max 15) ───────────────
     o = 0
     if of["bias"] == "BUY":      o += 8
     elif of["bias"] == "SELL":   o -= 8
     if of["buy_vol_pct"] > 60:   o += 4
     elif of["buy_vol_pct"] < 40: o -= 4
-    if of["absorption"]:         o += 3   # smart money absorbing → reversal signal
+    if of["absorption"]:         o += 3
     if vol_ratio >= 1.5:         o += 3
     elif vol_ratio < 0.7:        o -= 3
     cats["ORDERFLOW"] = max(-15, min(15, o))
 
-    # ── 5. FVG / IMBALANCE (max 10) ───────────────
     f = 0
-    if fvg["in_bull_fvg"]:       f += 10   # price in bullish FVG → strong BUY zone
+    if fvg["in_bull_fvg"]:       f += 10
     elif fvg["in_bear_fvg"]:     f -= 10
-    elif fvg["count_bull"] > 0:  f += 3    # nearby bull FVGs
+    elif fvg["count_bull"] > 0:  f += 3
     elif fvg["count_bear"] > 0:  f -= 3
     cats["FVG"] = max(-10, min(10, f))
 
-    # ── 6. MTF BIAS (max 15) ──────────────────────
     mtf_s = 0
     if mtf["bias"] == "BULLISH":   mtf_s += 15
     elif mtf["bias"] == "BEARISH": mtf_s -= 15
-    else:                           mtf_s += 0
     cats["MTF"] = max(-15, min(15, mtf_s))
 
-    # ── 7. SESSION (max 10) ───────────────────────
     cats["SESSION"] = max(-10, min(10, sess["score_mod"]))
 
-    # ── 8. BOLLINGER BAND (max 5) ─────────────────
     b = 0
     if bb_pos < 0.15:   b += 5
     elif bb_pos > 0.85: b -= 5
     cats["BB"] = b
 
-    # ── TOTAL (baseline 50, add cats) ─────────────
     total = 50 + sum(cats.values())
     total = max(0, min(100, total))
 
-    # ── CONFLUENCE COUNT ──────────────────────────
-    # how many categories agree with the direction
     direction = "BUY" if total >= 55 else "SELL"
     agree = sum([
         cats["TREND"]     > 0 if direction == "BUY" else cats["TREND"]     < 0,
@@ -1007,7 +894,7 @@ def advanced_score(
     return {
         "total":       total,
         "cats":        cats,
-        "confluence":  agree,   # out of 6
+        "confluence":  agree,
     }
 
 # ==================================================
@@ -1038,78 +925,36 @@ def liquidity_pools(df: pd.DataFrame, swing: int = 20) -> dict:
     }
 
 # ==================================================
-# ANTI-LIQUIDITY-SWEEP  TP1/TP2  SL1/SL2
-# ==================================================
-# Logika level:
-#
-#  BUY:
-#   SL1 = entry - 1.0×ATR            (tight, untuk partial exit jika salah)
-#   SL2 = swing_low - buf             (anti-sweep, SL utama beyond pool)
-#   TP1 = entry + 1.0×ATR            (quick profit, 1:1 RR dari SL1)
-#   TP2 = entry + 2.5×(entry-SL2)    (full target, 1:2.5 RR dari SL2)
-#
-#  SELL:
-#   SL1 = entry + 1.0×ATR
-#   SL2 = swing_high + buf
-#   TP1 = entry - 1.0×ATR
-#   TP2 = entry - 2.5×(SL2-entry)
-#
-#  Aturan relevansi:
-#   - SL1 tidak boleh > 1.5×ATR dari entry
-#   - SL2 tidak boleh > 3.0×ATR dari entry (cegah absurd)
-#   - TP1 selalu lebih dekat dari TP2
-#   - Gap TP1-TP2 proporsional terhadap ATR (bukan terlalu jauh)
+# TP/SL ANTI-SWEEP
 # ==================================================
 def tp_sl_anti_sweep(df: pd.DataFrame, action: str, atr_val: float) -> dict:
     price = float(df["Close"].iloc[-1])
     pools = liquidity_pools(df)
 
     if action == "BUY":
-        # ── SL ──────────────────────────────────
-        # SL1: tight — 1.0×ATR di bawah entry
         sl1       = price - 1.0 * atr_val
-
-        # SL2: anti-sweep — di luar swing_low pool, max 3×ATR
         raw_sl2   = pools["buy_side_liq"] - pools["buf"]
         sl2       = max(raw_sl2, price - 3.0 * atr_val)
-        # pastikan sl2 <= sl1 (lebih jauh dari entry)
         sl2       = min(sl2, sl1 - 0.1 * atr_val)
-
         sl1_dist  = abs(price - sl1)
         sl2_dist  = abs(price - sl2)
-
-        # ── TP ──────────────────────────────────
-        # TP1: 1:1 RR dari SL1 — dekat, realistis
         tp1       = price + sl1_dist
-
-        # TP2: 2.5× jarak SL2 — target penuh, namun dibatasi
-        # agar tidak absurd: max 2× jarak TP1 dari entry
         tp2_raw   = price + 2.5 * sl2_dist
         tp2       = min(tp2_raw, price + 2.0 * (tp1 - price) * 1.5)
-        # pastikan tp2 > tp1
         tp2       = max(tp2, tp1 + 0.5 * atr_val)
-
         sweep_ref = pools["buy_side_liq"]
         sweep_dir = "below"
-
-    else:  # SELL
-        # ── SL ──────────────────────────────────
+    else:
         sl1       = price + 1.0 * atr_val
-
         raw_sl2   = pools["sell_side_liq"] + pools["buf"]
         sl2       = min(raw_sl2, price + 3.0 * atr_val)
         sl2       = max(sl2, sl1 + 0.1 * atr_val)
-
         sl1_dist  = abs(price - sl1)
         sl2_dist  = abs(price - sl2)
-
-        # ── TP ──────────────────────────────────
         tp1       = price - sl1_dist
-
         tp2_raw   = price - 2.5 * sl2_dist
         tp2       = max(tp2_raw, price - 2.0 * (price - tp1) * 1.5)
         tp2       = min(tp2, tp1 - 0.5 * atr_val)
-
         sweep_ref = pools["sell_side_liq"]
         sweep_dir = "above"
 
@@ -1117,17 +962,11 @@ def tp_sl_anti_sweep(df: pd.DataFrame, action: str, atr_val: float) -> dict:
     rr2 = abs(tp2 - price) / sl2_dist if sl2_dist > 0 else 0
 
     return {
-        # primary (used elsewhere for compatibility)
         "tp":  tp2,   "sl":  sl2,   "rr":  rr2,
-        # TP levels
         "tp1": tp1,   "tp2": tp2,
-        # SL levels
         "sl1": sl1,   "sl2": sl2,
-        # distances
         "sl1_dist": sl1_dist,  "sl2_dist": sl2_dist,
-        # RR
         "rr1": rr1,   "rr2": rr2,
-        # sweep info
         "sweep_ref":  sweep_ref,
         "sweep_dir":  sweep_dir,
         "buf":        pools["buf"],
@@ -1136,7 +975,7 @@ def tp_sl_anti_sweep(df: pd.DataFrame, action: str, atr_val: float) -> dict:
     }
 
 # ==================================================
-# GENERATE SIGNAL  (full pipeline)
+# GENERATE SIGNAL  — UPGRADED with Regime + ML
 # ==================================================
 def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
     df     = get_data(pair, timeframe)
@@ -1164,34 +1003,68 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
     lstm           = lstm_prediction(df)
     trend          = trend_strength(df)
 
-    # ── NEW engines ───────────────────────────────
+    # ── new engines ───────────────────────────────
     of             = delta_orderflow(df)
     fvg            = fvg_engine(df)
     sess           = session_filter(pair)
-    mtf            = mtf_bias(pair, timeframe)   # fetches HTF data
+    mtf            = mtf_bias(pair, timeframe)
 
-    # ── advanced scoring ──────────────────────────
+    # ── rule-based scoring ────────────────────────
     sc             = advanced_score(
         lstm, smc_data, liq, fl, rsi_val, macd_hist_val,
         ema_conf, rsi_div, vol_ratio_val, stoch_k_val, bb_pos,
         of, fvg, mtf, sess, trend,
     )
-    score      = sc["total"]
-    action     = "BUY" if score >= 55 else "SELL"
-    sl_data    = tp_sl_anti_sweep(df, action, atr_val)
-    price      = float(close.iloc[-1])
 
-    return {
+    # ── [NEW] Regime Detection ────────────────────
+    regime_data = detect_regime(df)
+
+    # First-pass action for regime modifier calculation
+    reg_mod     = regime_score_modifier(regime_data, "BUY")
+    rule_score  = max(0, min(100, sc["total"] + reg_mod))
+    action      = "BUY" if rule_score >= 55 else "SELL"
+
+    # Recalculate with correct action direction
+    reg_mod     = regime_score_modifier(regime_data, action)
+    rule_score  = max(0, min(100, sc["total"] + reg_mod))
+    action      = "BUY" if rule_score >= 55 else "SELL"
+
+    # ── [NEW] ML Adaptive Scoring ─────────────────
+    _signal_draft = {
+        "pair":       pair,
+        "timeframe":  timeframe,
+        "score":      rule_score,
+        "rule_score": rule_score,
+        "cats":       sc["cats"],
+        "rsi":        rsi_val,
+        "stoch_k":    stoch_k_val,
+        "bb_pos":     bb_pos,
+        "vol_ratio":  vol_ratio_val,
+        "trend":      trend,
+        "action":     action,
+        "ema":        ema_conf,
+        "orderflow":  of,
+        "mtf":        mtf,
+    }
+    ml_result = adaptive_score(rule_score, _signal_draft)
+    score     = ml_result["adaptive_score"]
+    action    = "BUY" if score >= 55 else "SELL"
+
+    sl_data   = tp_sl_anti_sweep(df, action, atr_val)
+    price     = float(close.iloc[-1])
+
+    result = {
         "pair":       pair,
         "timeframe":  timeframe,
         "score":      score,
+        "rule_score": rule_score,
         "cats":       sc["cats"],
         "confluence": sc["confluence"],
         "confidence": confidence_label(score, sc["confluence"]),
         "action":     action,
         "entry":      price,
-        "tp":         sl_data["tp2"],   # primary TP = TP2
-        "sl":         sl_data["sl2"],   # primary SL = SL2
+        "tp":         sl_data["tp2"],
+        "sl":         sl_data["sl2"],
         "tp1":        sl_data["tp1"],
         "tp2":        sl_data["tp2"],
         "sl1":        sl_data["sl1"],
@@ -1217,12 +1090,30 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
         "session":    sess,
         "mtf":        mtf,
         "sweep":      sl_data,
+        "regime":     regime_data,
+        "ml":         ml_result,
         "df":         df,
     }
 
+    # ── [NEW] Persist to DB + background retrain ──
+    try:
+        log_signal(result)
+        log_score_history(result)
+
+        def _bg_retrain():
+            rows = get_training_data()
+            if rows:
+                maybe_retrain(rows)
+        threading.Thread(target=_bg_retrain, daemon=True).start()
+
+    except Exception as e:
+        print(f"[DB LOG ERROR] {e}")
+
+    return result
+
 
 # ==================================================
-# FORMAT SIGNAL (Discord Embed)
+# FORMAT SIGNAL (Discord Embed)  — UPGRADED
 # ==================================================
 def build_embed(data: dict) -> discord.Embed:
     action_color = discord.Color.green() if data["action"] == "BUY" else discord.Color.red()
@@ -1235,21 +1126,27 @@ def build_embed(data: dict) -> discord.Embed:
     cats = data["cats"]
     tr   = data["trend"]
 
+    # Rule score vs adaptive score display
+    rule_s = data.get("rule_score", data["score"])
+    ml_tag = (
+        f" _(rule: {rule_s:.0f})_"
+        if abs(data["score"] - rule_s) >= 1 else ""
+    )
+
     embed = discord.Embed(
         title = (
             f"{action_emoji} {data['pair']} — {data['action']} SIGNAL  "
             f"[{data['confluence']}/6 confluence]"
         ),
         description = (
-            f"**AI Score:** `{data['score']}%` — {data['confidence']}\n"
+            f"**AI Score:** `{data['score']:.1f}%`{ml_tag} — {data['confidence']}\n"
             f"**Session:** `{sess['session']}`  `{sess['utc_time']}`  "
             f"{'✅ Tradeable' if sess['tradeable'] else '⚠️ Off-session'}"
         ),
         color = action_color,
     )
 
-    # ── Entry / TP1 / TP2 / SL1 / SL2 ───────────
-    is_buy = data["action"] == "BUY"
+    # ── Entry / TP / SL ──────────────────────────
     embed.add_field(
         name  = "📍 Entry  |  🎯 TP Levels  |  🛑 SL Levels",
         value = (
@@ -1351,7 +1248,6 @@ def build_embed(data: dict) -> discord.Embed:
     )
 
     # ── Anti-Sweep SL ─────────────────────────────
-    sweep_side = "Buy-Side Pool" if data["action"] == "BUY" else "Sell-Side Pool"
     sweep_pos  = "di bawah" if data["action"] == "BUY" else "di atas"
     embed.add_field(
         name  = "🛡️ Anti Liquidity Sweep SL",
@@ -1363,14 +1259,34 @@ def build_embed(data: dict) -> discord.Embed:
         inline=False,
     )
 
+    # ── [NEW] Regime Detection ────────────────────
+    if "regime" in data:
+        skip_flag, skip_reason = should_skip(data["regime"], data["action"], data["score"])
+        regime_val = regime_embed_value(data["regime"])
+        if skip_flag:
+            regime_val += f"\n⚠️ **SKIP ALERT:** {skip_reason}"
+        embed.add_field(
+            name   = f"{data['regime']['emoji']} Market Regime",
+            value  = regime_val,
+            inline = False,
+        )
+
+    # ── [NEW] ML Adaptive Score ───────────────────
+    if "ml" in data:
+        embed.add_field(
+            name   = "🤖 ML Adaptive Score",
+            value  = ml_embed_value(data["ml"]),
+            inline = False,
+        )
+
     embed.set_footer(
-        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | AI Institutional Engine v3"
+        text=f"⏱ TF: {data['timeframe'].upper()} | MTF: {'+'.join(mtf['htf_list'])} | AI Institutional Engine v4"
     )
     return embed
 
 
 # ==================================================
-# CHART  — matplotlib candle chart dengan TP/SL zone
+# CHART
 # ==================================================
 def create_chart(
     df: pd.DataFrame,
@@ -1381,8 +1297,8 @@ def create_chart(
     timeframe: str = DEFAULT_TF,
     sweep_data: dict = None,
     fvg_data:   dict = None,
-    tp1: float  = None,   # quick TP
-    sl1: float  = None,   # tight SL
+    tp1: float  = None,
+    sl1: float  = None,
     rr1: float  = 0.0,
     rr2: float  = 0.0,
 ) -> str:
@@ -1392,16 +1308,13 @@ def create_chart(
 
     df_c = df.copy()
 
-    # ── pastikan DatetimeIndex ────────────────────
     if not isinstance(df_c.index, pd.DatetimeIndex):
         df_c.index = pd.to_datetime(df_c.index)
 
-    # ── trim ke jumlah candle per TF ─────────────
     candle_limit = {"5m": 100, "15m": 100, "1h": 96, "4h": 60}
     n    = candle_limit.get(timeframe, 100)
     df_c = df_c.iloc[-n:]
 
-    # ── EMA ──────────────────────────────────────
     close = df_c["Close"]
     df_c["EMA8"]  = ema(close, 8)
     df_c["EMA21"] = ema(close, 21)
@@ -1416,118 +1329,59 @@ def create_chart(
     is_buy      = entry < tp
     action_lbl  = "BUY" if is_buy else "SELL"
 
-    # ── figure: 2 baris (chart + info panel) ─────
     fig = plt.figure(figsize=(18, 10), facecolor="#0d1117")
     gs  = fig.add_gridspec(
         2, 1, height_ratios=[5, 1],
         hspace=0.06, left=0.01, right=0.86, top=0.93, bottom=0.08,
     )
-    ax  = fig.add_subplot(gs[0])   # candle chart
-    ax2 = fig.add_subplot(gs[1])   # info bar bawah
+    ax  = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1])
 
     ax.set_facecolor("#0d1117")
     ax2.set_facecolor("#0d1117")
     ax2.axis("off")
 
-    # ═══════════════════════════════════════════════
-    # LAYER 0 — Liquidity Pool Zones (jika ada)
-    # ═══════════════════════════════════════════════
     if sweep_data:
         buy_pool  = sweep_data["buy_pool"]
         sell_pool = sweep_data["sell_pool"]
         buf       = sweep_data["buf"]
+        ax.axhspan(buy_pool - buf * 2, buy_pool, alpha=0.08, color="#ffd600", zorder=1)
+        ax.axhline(buy_pool, color="#ffd600", linewidth=0.9, linestyle=":", zorder=2, alpha=0.7)
+        ax.axhspan(sell_pool, sell_pool + buf * 2, alpha=0.08, color="#ce93d8", zorder=1)
+        ax.axhline(sell_pool, color="#ce93d8", linewidth=0.9, linestyle=":", zorder=2, alpha=0.7)
+        ax.text(0.2, buy_pool, f" BUY POOL  {buy_pool:.4f}", color="#ffd600", fontsize=7.5, va="bottom", alpha=0.85)
+        ax.text(0.2, sell_pool, f" SELL POOL  {sell_pool:.4f}", color="#ce93d8", fontsize=7.5, va="top", alpha=0.85)
 
-        # Buy-side liquidity pool (kuning transparan, bawah chart)
-        ax.axhspan(
-            buy_pool - buf * 2, buy_pool,
-            alpha=0.08, color="#ffd600", zorder=1,
-        )
-        ax.axhline(
-            buy_pool, color="#ffd600", linewidth=0.9,
-            linestyle=":", zorder=2, alpha=0.7,
-        )
-
-        # Sell-side liquidity pool (ungu transparan, atas chart)
-        ax.axhspan(
-            sell_pool, sell_pool + buf * 2,
-            alpha=0.08, color="#ce93d8", zorder=1,
-        )
-        ax.axhline(
-            sell_pool, color="#ce93d8", linewidth=0.9,
-            linestyle=":", zorder=2, alpha=0.7,
-        )
-
-        # Label pool di sisi kiri
-        ax.text(
-            0.2, buy_pool,
-            f" BUY POOL  {buy_pool:.4f}",
-            color="#ffd600", fontsize=7.5, va="bottom", alpha=0.85,
-        )
-        ax.text(
-            0.2, sell_pool,
-            f" SELL POOL  {sell_pool:.4f}",
-            color="#ce93d8", fontsize=7.5, va="top", alpha=0.85,
-        )
-
-    # ═══════════════════════════════════════════════
-    # LAYER 1 — TP Zones
-    # TP2 (outer, lighter green) → TP1 (inner, brighter green)
-    # ═══════════════════════════════════════════════
     if is_buy:
-        # TP2 zone: entry → tp (full)
         ax.axhspan(entry, tp,  alpha=0.08, color="#00c853", zorder=1)
-        # TP1 zone: entry → tp1 (brighter overlay)
         if tp1: ax.axhspan(entry, tp1, alpha=0.14, color="#69f0ae", zorder=1)
     else:
         ax.axhspan(tp,  entry, alpha=0.08, color="#00c853", zorder=1)
         if tp1: ax.axhspan(tp1, entry, alpha=0.14, color="#69f0ae", zorder=1)
 
-    # ═══════════════════════════════════════════════
-    # LAYER 2 — SL Zones
-    # SL1 (inner, orange) → SL2 (outer, red anti-sweep)
-    # ═══════════════════════════════════════════════
     if is_buy:
-        # SL2 zone: sl → entry (full, red)
         ax.axhspan(sl, entry,  alpha=0.10, color="#d50000", zorder=1)
-        # SL1 zone: sl1 → entry (tighter, orange overlay)
         if sl1: ax.axhspan(sl1, entry, alpha=0.14, color="#ff6d00", zorder=1)
     else:
         ax.axhspan(entry, sl,  alpha=0.10, color="#d50000", zorder=1)
         if sl1: ax.axhspan(entry, sl1, alpha=0.14, color="#ff6d00", zorder=1)
 
-    # Anti-sweep buffer & pool reference
     if sweep_data:
         sweep_ref = sweep_data["sweep_ref"]
         if is_buy:
             ax.axhspan(sl, sweep_ref, alpha=0.20, color="#b71c1c", zorder=1)
-            ax.axhline(sweep_ref, color="#ff6d00", linewidth=0.9,
-                       linestyle="-.", zorder=5, alpha=0.8)
-            ax.text(xs[-1] + 0.5, sweep_ref,
-                    f" POOL  {sweep_ref:.4f}",
-                    color="#ff6d00", fontsize=7, va="center", fontweight="bold")
+            ax.axhline(sweep_ref, color="#ff6d00", linewidth=0.9, linestyle="-.", zorder=5, alpha=0.8)
+            ax.text(xs[-1] + 0.5, sweep_ref, f" POOL  {sweep_ref:.4f}", color="#ff6d00", fontsize=7, va="center", fontweight="bold")
         else:
             ax.axhspan(sweep_ref, sl, alpha=0.20, color="#b71c1c", zorder=1)
-            ax.axhline(sweep_ref, color="#ff6d00", linewidth=0.9,
-                       linestyle="-.", zorder=5, alpha=0.8)
-            ax.text(xs[-1] + 0.5, sweep_ref,
-                    f" POOL  {sweep_ref:.4f}",
-                    color="#ff6d00", fontsize=7, va="center", fontweight="bold")
+            ax.axhline(sweep_ref, color="#ff6d00", linewidth=0.9, linestyle="-.", zorder=5, alpha=0.8)
+            ax.text(xs[-1] + 0.5, sweep_ref, f" POOL  {sweep_ref:.4f}", color="#ff6d00", fontsize=7, va="center", fontweight="bold")
 
-        # Buy/Sell pool horizontal markers
-        buy_pool  = sweep_data["buy_pool"]
-        sell_pool = sweep_data["sell_pool"]
-        ax.axhspan(buy_pool - sweep_data["buf"]*2, buy_pool,
-                   alpha=0.07, color="#ffd600", zorder=1)
-        ax.axhline(buy_pool, color="#ffd600", linewidth=0.8,
-                   linestyle=":", alpha=0.6, zorder=2)
-        ax.axhspan(sell_pool, sell_pool + sweep_data["buf"]*2,
-                   alpha=0.07, color="#ce93d8", zorder=1)
-        ax.axhline(sell_pool, color="#ce93d8", linewidth=0.8,
-                   linestyle=":", alpha=0.6, zorder=2)
+        ax.axhspan(sweep_data["buy_pool"] - sweep_data["buf"]*2, sweep_data["buy_pool"], alpha=0.07, color="#ffd600", zorder=1)
+        ax.axhline(sweep_data["buy_pool"], color="#ffd600", linewidth=0.8, linestyle=":", alpha=0.6, zorder=2)
+        ax.axhspan(sweep_data["sell_pool"], sweep_data["sell_pool"] + sweep_data["buf"]*2, alpha=0.07, color="#ce93d8", zorder=1)
+        ax.axhline(sweep_data["sell_pool"], color="#ce93d8", linewidth=0.8, linestyle=":", alpha=0.6, zorder=2)
 
-    # ═══════════════════════════════════════════════
-    # LAYER 3 — Candles
-    # ═══════════════════════════════════════════════
     w = 0.6
     for i, x in enumerate(xs):
         o, h, l, c = opens[i], highs[i], lows[i], closes[i]
@@ -1536,125 +1390,64 @@ def create_chart(
         body_lo = min(o, c)
         body_hi = max(o, c)
         rect = mpatches.FancyBboxPatch(
-            (x - w / 2, body_lo),
-            w, max(body_hi - body_lo, (h - l) * 0.003),
-            boxstyle="square,pad=0",
-            linewidth=0, facecolor=col, zorder=7,
+            (x - w / 2, body_lo), w,
+            max(body_hi - body_lo, (h - l) * 0.003),
+            boxstyle="square,pad=0", linewidth=0, facecolor=col, zorder=7,
         )
         ax.add_patch(rect)
 
-    # ═══════════════════════════════════════════════
-    # LAYER 3b — FVG Zones
-    # ═══════════════════════════════════════════════
     if fvg_data:
-        # Draw up to 3 most recent bull FVGs (cyan)
-        for fvg in fvg_data["bull_fvgs"][-3:]:
-            ax.axhspan(fvg["bottom"], fvg["top"],
-                       alpha=0.10, color="#00bcd4", zorder=2)
-            ax.axhline(fvg["top"],    color="#00bcd4", linewidth=0.6,
-                       linestyle=":", alpha=0.6, zorder=3)
-            ax.axhline(fvg["bottom"], color="#00bcd4", linewidth=0.6,
-                       linestyle=":", alpha=0.6, zorder=3)
-
-        # Draw up to 3 most recent bear FVGs (magenta)
-        for fvg in fvg_data["bear_fvgs"][-3:]:
-            ax.axhspan(fvg["bottom"], fvg["top"],
-                       alpha=0.10, color="#e040fb", zorder=2)
-            ax.axhline(fvg["top"],    color="#e040fb", linewidth=0.6,
-                       linestyle=":", alpha=0.6, zorder=3)
-            ax.axhline(fvg["bottom"], color="#e040fb", linewidth=0.6,
-                       linestyle=":", alpha=0.6, zorder=3)
-
-        # Label nearest FVGs
+        for fv in fvg_data["bull_fvgs"][-3:]:
+            ax.axhspan(fv["bottom"], fv["top"], alpha=0.10, color="#00bcd4", zorder=2)
+            ax.axhline(fv["top"],    color="#00bcd4", linewidth=0.6, linestyle=":", alpha=0.6, zorder=3)
+            ax.axhline(fv["bottom"], color="#00bcd4", linewidth=0.6, linestyle=":", alpha=0.6, zorder=3)
+        for fv in fvg_data["bear_fvgs"][-3:]:
+            ax.axhspan(fv["bottom"], fv["top"], alpha=0.10, color="#e040fb", zorder=2)
+            ax.axhline(fv["top"],    color="#e040fb", linewidth=0.6, linestyle=":", alpha=0.6, zorder=3)
+            ax.axhline(fv["bottom"], color="#e040fb", linewidth=0.6, linestyle=":", alpha=0.6, zorder=3)
         nb = fvg_data["nearest_bull"]
         nd = fvg_data["nearest_bear"]
         if nb:
-            ax.text(0.5, (nb["top"] + nb["bottom"]) / 2,
-                    f"  BULL FVG {nb['bottom']:.4f}-{nb['top']:.4f}",
-                    color="#00bcd4", fontsize=6.5, va="center", alpha=0.85)
+            ax.text(0.5, (nb["top"] + nb["bottom"]) / 2, f"  BULL FVG {nb['bottom']:.4f}-{nb['top']:.4f}", color="#00bcd4", fontsize=6.5, va="center", alpha=0.85)
         if nd:
-            ax.text(0.5, (nd["top"] + nd["bottom"]) / 2,
-                    f"  BEAR FVG {nd['bottom']:.4f}-{nd['top']:.4f}",
-                    color="#e040fb", fontsize=6.5, va="center", alpha=0.85)
+            ax.text(0.5, (nd["top"] + nd["bottom"]) / 2, f"  BEAR FVG {nd['bottom']:.4f}-{nd['top']:.4f}", color="#e040fb", fontsize=6.5, va="center", alpha=0.85)
 
-    # ═══════════════════════════════════════════════
-    # LAYER 4 — EMA
-    # ═══════════════════════════════════════════════
     ax.plot(xs, df_c["EMA8"].values,  color="#00e5ff", linewidth=1.0, label="EMA 8",  zorder=8)
     ax.plot(xs, df_c["EMA21"].values, color="#ffeb3b", linewidth=1.0, label="EMA 21", zorder=8)
     ax.plot(xs, df_c["EMA50"].values, color="#ff9800", linewidth=1.2, label="EMA 50", zorder=8)
 
-    # ═══════════════════════════════════════════════
-    # LAYER 5 — TP2 / TP1 / Entry / SL1 / SL2 lines
-    # ═══════════════════════════════════════════════
     lx = xs[-1] + 0.5
-
-    # TP2 — outer target (solid bright green)
     ax.axhline(tp, color="#00e676", linewidth=1.8, linestyle="--", zorder=9)
-    ax.text(lx, tp, f" [TP2]  {tp:.4f}  RR 1:{rr2:.2f}",
-            color="#00e676", fontsize=8, va="center", fontweight="bold")
-
-    # TP1 — quick target (lighter green, solid)
+    ax.text(lx, tp, f" [TP2]  {tp:.4f}  RR 1:{rr2:.2f}", color="#00e676", fontsize=8, va="center", fontweight="bold")
     if tp1:
         ax.axhline(tp1, color="#b9f6ca", linewidth=1.3, linestyle="-.", zorder=9)
-        ax.text(lx, tp1, f" [TP1]  {tp1:.4f}  RR 1:{rr1:.2f}",
-                color="#b9f6ca", fontsize=8, va="center", fontweight="bold")
-
-    # Entry
+        ax.text(lx, tp1, f" [TP1]  {tp1:.4f}  RR 1:{rr1:.2f}", color="#b9f6ca", fontsize=8, va="center", fontweight="bold")
     ax.axhline(entry, color="#ffffff", linewidth=1.1, linestyle="--", zorder=9, alpha=0.85)
-    ax.text(lx, entry, f" ENTRY  {entry:.4f}",
-            color="#ffffff", fontsize=8, va="center", fontweight="bold", alpha=0.9)
-
-    # SL1 — tight stop (orange)
+    ax.text(lx, entry, f" ENTRY  {entry:.4f}", color="#ffffff", fontsize=8, va="center", fontweight="bold", alpha=0.9)
     if sl1:
         ax.axhline(sl1, color="#ffab40", linewidth=1.3, linestyle="-.", zorder=9)
-        ax.text(lx, sl1, f" [SL1]  {sl1:.4f}  1xATR",
-                color="#ffab40", fontsize=8, va="center", fontweight="bold")
-
-    # SL2 — anti-sweep (red)
+        ax.text(lx, sl1, f" [SL1]  {sl1:.4f}  1xATR", color="#ffab40", fontsize=8, va="center", fontweight="bold")
     ax.axhline(sl, color="#ff1744", linewidth=1.8, linestyle="--", zorder=9)
-    ax.text(lx, sl, f" [SL2]  {sl:.4f}  anti-sweep",
-            color="#ff1744", fontsize=8, va="center", fontweight="bold")
+    ax.text(lx, sl, f" [SL2]  {sl:.4f}  anti-sweep", color="#ff1744", fontsize=8, va="center", fontweight="bold")
 
-    # ═══════════════════════════════════════════════
-    # LAYER 6 — RR bracket (panah sisi kiri, 2 pasang)
-    # ═══════════════════════════════════════════════
-    bx1 = -0.8    # bracket TP1/SL1
-    bx2 = -2.0    # bracket TP2/SL2
-
+    bx1 = -0.8
+    bx2 = -2.0
     if tp1 and sl1:
-        # TP1 bracket (bx1)
-        ax.annotate("", xy=(bx1, tp1), xytext=(bx1, entry),
-                    arrowprops=dict(arrowstyle="<->", color="#b9f6ca", lw=1.0))
-        ax.text(bx1 - 0.2, (entry + tp1) / 2, "T1",
-                color="#b9f6ca", fontsize=6.5, ha="right", va="center")
-        # SL1 bracket (bx1)
-        ax.annotate("", xy=(bx1, sl1), xytext=(bx1, entry),
-                    arrowprops=dict(arrowstyle="<->", color="#ffab40", lw=1.0))
-        ax.text(bx1 - 0.2, (entry + sl1) / 2, "S1",
-                color="#ffab40", fontsize=6.5, ha="right", va="center")
+        ax.annotate("", xy=(bx1, tp1), xytext=(bx1, entry), arrowprops=dict(arrowstyle="<->", color="#b9f6ca", lw=1.0))
+        ax.text(bx1 - 0.2, (entry + tp1) / 2, "T1", color="#b9f6ca", fontsize=6.5, ha="right", va="center")
+        ax.annotate("", xy=(bx1, sl1), xytext=(bx1, entry), arrowprops=dict(arrowstyle="<->", color="#ffab40", lw=1.0))
+        ax.text(bx1 - 0.2, (entry + sl1) / 2, "S1", color="#ffab40", fontsize=6.5, ha="right", va="center")
+    ax.annotate("", xy=(bx2, tp), xytext=(bx2, entry), arrowprops=dict(arrowstyle="<->", color="#00e676", lw=1.2))
+    ax.text(bx2 - 0.2, (entry + tp) / 2, "T2", color="#00e676", fontsize=6.5, ha="right", va="center")
+    ax.annotate("", xy=(bx2, sl), xytext=(bx2, entry), arrowprops=dict(arrowstyle="<->", color="#ff1744", lw=1.2))
+    ax.text(bx2 - 0.2, (entry + sl) / 2, "S2", color="#ff1744", fontsize=6.5, ha="right", va="center")
 
-    # TP2 bracket (bx2)
-    ax.annotate("", xy=(bx2, tp), xytext=(bx2, entry),
-                arrowprops=dict(arrowstyle="<->", color="#00e676", lw=1.2))
-    ax.text(bx2 - 0.2, (entry + tp) / 2, "T2",
-            color="#00e676", fontsize=6.5, ha="right", va="center")
-    # SL2 bracket (bx2)
-    ax.annotate("", xy=(bx2, sl), xytext=(bx2, entry),
-                arrowprops=dict(arrowstyle="<->", color="#ff1744", lw=1.2))
-    ax.text(bx2 - 0.2, (entry + sl) / 2, "S2",
-            color="#ff1744", fontsize=6.5, ha="right", va="center")
-
-    # ═══════════════════════════════════════════════
-    # Axes formatting
-    # ═══════════════════════════════════════════════
     tick_every  = max(1, len(xs) // 10)
     tick_idx    = xs[::tick_every]
     tick_labels = [df_c.index[i].strftime("%m/%d %H:%M") for i in tick_idx]
     ax.set_xticks(tick_idx)
     ax.set_xticklabels(tick_labels, rotation=30, ha="right", fontsize=7, color="#aaaaaa")
 
-    # y-range: cukupkan agar semua level terlihat
     all_levels = [min(lows), max(highs), tp, sl]
     if tp1:  all_levels.append(tp1)
     if sl1:  all_levels.append(sl1)
@@ -1664,7 +1457,7 @@ def create_chart(
     y_hi = max(all_levels)
     pad  = (y_hi - y_lo) * 0.07
     ax.set_ylim(y_lo - pad, y_hi + pad)
-    ax.set_xlim(-2.8, xs[-1] + 15)   # lebih lebar kiri (bracket) dan kanan (label)
+    ax.set_xlim(-2.8, xs[-1] + 15)
 
     ax.yaxis.set_tick_params(labelcolor="#aaaaaa", labelsize=8)
     ax.yaxis.tick_right()
@@ -1673,9 +1466,6 @@ def create_chart(
     for spine in ax.spines.values():
         spine.set_edgecolor("#1f2937")
 
-    # ═══════════════════════════════════════════════
-    # Legend (manual — lebih rapi)
-    # ═══════════════════════════════════════════════
     legend_items = [
         Line2D([0], [0], color="#00e5ff", lw=1.2, label="EMA 8"),
         Line2D([0], [0], color="#ffeb3b", lw=1.2, label="EMA 21"),
@@ -1694,15 +1484,9 @@ def create_chart(
             Line2D([0], [0], color="#ff6d00", lw=1, linestyle="-.", label="Liq Sweep Ref"),
             mpatches.Patch(facecolor="#b71c1c", alpha=0.5, label="Anti-Sweep Buffer"),
         ]
-    ax.legend(
-        handles=legend_items, loc="upper left", fontsize=7.5,
-        facecolor="#161b22", edgecolor="#30363d", labelcolor="#cccccc",
-        ncol=2, framealpha=0.85,
-    )
+    ax.legend(handles=legend_items, loc="upper left", fontsize=7.5, facecolor="#161b22",
+              edgecolor="#30363d", labelcolor="#cccccc", ncol=2, framealpha=0.85)
 
-    # ═══════════════════════════════════════════════
-    # Title
-    # ═══════════════════════════════════════════════
     rr_val = rr2 if rr2 else (abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0)
     title_color = "#00e676" if is_buy else "#ff1744"
     fig.suptitle(
@@ -1711,12 +1495,9 @@ def create_chart(
         color=title_color, fontsize=13, fontweight="bold", y=0.97,
     )
 
-    # ═══════════════════════════════════════════════
-    # Info bar bawah — ringkasan anti-sweep
-    # ═══════════════════════════════════════════════
     if sweep_data:
-        tp1_str  = f"{tp1:.4f}" if tp1 else "-"
-        sl1_str  = f"{sl1:.4f}" if sl1 else "-"
+        tp1_str = f"{tp1:.4f}" if tp1 else "-"
+        sl1_str = f"{sl1:.4f}" if sl1 else "-"
         sweep_txt = (
             f"[TP1] {tp1_str} (RR 1:{rr1:.2f})  |  "
             f"[TP2] {tp:.4f} (RR 1:{rr2:.2f})  ||  "
@@ -1737,15 +1518,9 @@ def create_chart(
         bbox=dict(facecolor="#161b22", edgecolor="#30363d", boxstyle="round,pad=0.4"),
     )
 
-    # ═══════════════════════════════════════════════
-    # Watermark
-    # ═══════════════════════════════════════════════
-    ax.text(
-        0.5, 0.5, "AI INSTITUTIONAL BOT",
-        transform=ax.transAxes,
-        fontsize=30, color="white", alpha=0.03,
-        ha="center", va="center", rotation=30, fontweight="bold",
-    )
+    ax.text(0.5, 0.5, "AI INSTITUTIONAL BOT", transform=ax.transAxes,
+            fontsize=30, color="white", alpha=0.03,
+            ha="center", va="center", rotation=30, fontweight="bold")
 
     filename = f"{pair}_candles.png"
     plt.savefig(filename, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -1756,21 +1531,17 @@ def create_chart(
 # UI VIEWS
 # ==================================================
 
-# ── Pair selector dropdown ────────────────────────
 class PairSelectView(View):
     def __init__(self, timeframe: str = DEFAULT_TF, mode: str = "signal"):
         super().__init__(timeout=60)
         self.timeframe = timeframe
-        self.mode      = mode   # "signal" | "chart"
+        self.mode      = mode
 
         options = [
             discord.SelectOption(label=p, description=PAIRS[p]["yf"], emoji="📈")
             for p in PAIRS
         ]
-        select = Select(
-            placeholder = "Pilih pair...",
-            options     = options,
-        )
+        select = Select(placeholder="Pilih pair...", options=options)
         select.callback = self.on_pair_select
         self.add_item(select)
 
@@ -1779,13 +1550,13 @@ class PairSelectView(View):
         await interaction.response.defer()
         await send_signal_or_chart(interaction, pair, self.timeframe, self.mode)
 
-# ── Timeframe selector dropdown ───────────────────
+
 class TimeframeSelectView(View):
     def __init__(self, pair: str, mode: str = "signal", channel_id: int = None):
         super().__init__(timeout=60)
         self.pair       = pair
         self.mode       = mode
-        self.channel_id = channel_id   # channel tujuan hasil signal
+        self.channel_id = channel_id
 
         options = [
             discord.SelectOption(label=tf.upper(), value=tf, description=f"Interval {tf}")
@@ -1797,13 +1568,11 @@ class TimeframeSelectView(View):
 
     async def on_tf_select(self, interaction: discord.Interaction):
         tf = interaction.data["values"][0]
-        # acknowledge dulu agar tidak timeout
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(
             f"⏳ Memproses `{self.pair}` `{tf.upper()}`...", ephemeral=True
         )
 
-        # kirim hasil ke channel asli, bukan ephemeral
         channel = (
             interaction.channel
             if self.channel_id is None
@@ -1815,12 +1584,10 @@ class TimeframeSelectView(View):
             view  = SignalActionView(data)
             if self.mode == "chart":
                 path = await run_blocking(
-                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"], tf, data["sweep"], data["fvg"], data["tp1"], data["sl1"], data["rr1"], data["rr2"]
+                    create_chart, data["df"], self.pair, data["entry"], data["tp"], data["sl"],
+                    tf, data["sweep"], data["fvg"], data["tp1"], data["sl1"], data["rr1"], data["rr2"]
                 )
-                await channel.send(
-                    f"📊 **{self.pair}** `{tf.upper()}` Candle Chart",
-                    file=discord.File(path),
-                )
+                await channel.send(f"📊 **{self.pair}** `{tf.upper()}` Candle Chart", file=discord.File(path))
             else:
                 await channel.send(embed=embed, view=view)
         except Exception as e:
@@ -1828,7 +1595,7 @@ class TimeframeSelectView(View):
             print(f"TF SELECT ERROR [{self.pair}|{tf}]:\n{tb}")
             await channel.send(f"❌ Error `{self.pair}` `{tf}`: `{e}`")
 
-# ── Signal result buttons ─────────────────────────
+
 class SignalActionView(View):
     def __init__(self, data: dict):
         super().__init__(timeout=120)
@@ -1837,9 +1604,12 @@ class SignalActionView(View):
     @discord.ui.button(label="📊 Candle Chart", style=discord.ButtonStyle.primary)
     async def show_chart(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
-        d    = self.data
+        d = self.data
         try:
-            path = await run_blocking(create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"], d["timeframe"], d["sweep"], d["fvg"], d["tp1"], d["sl1"], d["rr1"], d["rr2"])
+            path = await run_blocking(
+                create_chart, d["df"], d["pair"], d["entry"], d["tp"], d["sl"],
+                d["timeframe"], d["sweep"], d["fvg"], d["tp1"], d["sl1"], d["rr1"], d["rr2"]
+            )
             await interaction.followup.send(
                 f"📊 **{d['pair']}** `{d['timeframe'].upper()}` Candle Chart",
                 file=discord.File(path),
@@ -1864,14 +1634,8 @@ class SignalActionView(View):
 
     @discord.ui.button(label="📋 Ganti Timeframe", style=discord.ButtonStyle.secondary)
     async def change_tf(self, interaction: discord.Interaction, button: Button):
-        view = TimeframeSelectView(
-            self.data["pair"],
-            mode       = "signal",
-            channel_id = interaction.channel_id,
-        )
-        await interaction.response.send_message(
-            "⏱ Pilih timeframe:", view=view, ephemeral=True
-        )
+        view = TimeframeSelectView(self.data["pair"], mode="signal", channel_id=interaction.channel_id)
+        await interaction.response.send_message("⏱ Pilih timeframe:", view=view, ephemeral=True)
 
     @discord.ui.button(label="🏆 Best Signal Semua Pair", style=discord.ButtonStyle.success)
     async def best_signal(self, interaction: discord.Interaction, button: Button):
@@ -1879,14 +1643,13 @@ class SignalActionView(View):
         await interaction.followup.send(f"⏳ Scanning semua pair `{self.data['timeframe'].upper()}`...")
         await scan_best_and_send(interaction, self.data["timeframe"])
 
-# ── Main menu buttons ─────────────────────────────
+
 class MainMenuView(View):
     def __init__(self):
         super().__init__(timeout=120)
 
     @discord.ui.button(label="🏆 Best Signal", style=discord.ButtonStyle.success, row=0)
     async def best_signal(self, interaction: discord.Interaction, button: Button):
-        # First show TF selector
         view = TimeframeSelectMenu(mode="best")
         await interaction.response.send_message("⏱ Pilih timeframe:", view=view, ephemeral=True)
 
@@ -1911,19 +1674,14 @@ class MainMenuView(View):
         global AUTO_SIGNAL
         AUTO_SIGNAL = not AUTO_SIGNAL
         status = "🟢 AKTIF" if AUTO_SIGNAL else "🔴 MATI"
-        await interaction.response.send_message(
-            f"Auto Signal sekarang: **{status}**", ephemeral=True
-        )
+        await interaction.response.send_message(f"Auto Signal sekarang: **{status}**", ephemeral=True)
+
 
 class TimeframeSelectMenu(View):
-    """Standalone TF picker untuk best-signal mode."""
     def __init__(self, mode: str = "best"):
         super().__init__(timeout=60)
         self.mode = mode
-        options = [
-            discord.SelectOption(label=tf.upper(), value=tf)
-            for tf in TIMEFRAMES
-        ]
+        options = [discord.SelectOption(label=tf.upper(), value=tf) for tf in TIMEFRAMES]
         sel = Select(placeholder="Pilih timeframe...", options=options)
         sel.callback = self.on_select
         self.add_item(sel)
@@ -1931,9 +1689,7 @@ class TimeframeSelectMenu(View):
     async def on_select(self, interaction: discord.Interaction):
         tf = interaction.data["values"][0]
         await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(
-            f"⏳ Mencari best signal `{tf.upper()}`...", ephemeral=True
-        )
+        await interaction.followup.send(f"⏳ Mencari best signal `{tf.upper()}`...", ephemeral=True)
         channel = interaction.channel
 
         async def _safe(pair):
@@ -1951,50 +1707,42 @@ class TimeframeSelectMenu(View):
             return
 
         best  = max(results, key=lambda x: x["score"])
-        path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"], best["fvg"], best["tp1"], best["sl1"], best["rr1"], best["rr2"])
+        path  = await run_blocking(
+            create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"],
+            best["timeframe"], best["sweep"], best["fvg"], best["tp1"], best["sl1"], best["rr1"], best["rr2"]
+        )
         embed = build_embed(best)
         view  = SignalActionView(best)
         await channel.send(embed=embed, view=view, file=discord.File(path))
 
+
 # ==================================================
 # HELPER: send signal or chart
 # ==================================================
-async def send_signal_or_chart(
-    interaction: discord.Interaction,
-    pair: str,
-    timeframe: str,
-    mode: str,
-):
+async def send_signal_or_chart(interaction, pair, timeframe, mode):
     try:
-        # jalankan di thread pool agar tidak freeze event loop
         data = await run_blocking(generate_signal, pair, timeframe)
-
         if mode == "chart":
             path = await run_blocking(
-                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"], data["timeframe"], data["sweep"], data["fvg"], data["tp1"], data["sl1"], data["rr1"], data["rr2"]
+                create_chart, data["df"], pair, data["entry"], data["tp"], data["sl"],
+                data["timeframe"], data["sweep"], data["fvg"], data["tp1"], data["sl1"], data["rr1"], data["rr2"]
             )
-            await interaction.followup.send(
-                f"📊 **{pair}** `{timeframe.upper()}` Candle Chart",
-                file=discord.File(path),
-            )
+            await interaction.followup.send(f"📊 **{pair}** `{timeframe.upper()}` Candle Chart", file=discord.File(path))
         else:
             embed = build_embed(data)
             view  = SignalActionView(data)
             await interaction.followup.send(embed=embed, view=view)
-
     except Exception as e:
         tb = traceback.format_exc()
         print(f"send_signal_or_chart ERROR [{pair}|{timeframe}]:\n{tb}")
         await interaction.followup.send(f"❌ Error memproses {pair}: `{e}`")
 
-# ==================================================
-# HELPER: scan best pair
-# ==================================================
-async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
+
+async def scan_best_and_send(interaction, timeframe):
     sem = _get_tv_semaphore()
 
     async def _safe_signal(pair):
-        async with sem:   # max 2 TV calls bersamaan
+        async with sem:
             try:
                 return await run_blocking(generate_signal, pair, timeframe)
             except Exception as e:
@@ -2009,15 +1757,16 @@ async def scan_best_and_send(interaction: discord.Interaction, timeframe: str):
         return
 
     best  = max(results, key=lambda x: x["score"])
-    path  = await run_blocking(create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"], best["timeframe"], best["sweep"], best["fvg"], best["tp1"], best["sl1"], best["rr1"], best["rr2"])
+    path  = await run_blocking(
+        create_chart, best["df"], best["pair"], best["entry"], best["tp"], best["sl"],
+        best["timeframe"], best["sweep"], best["fvg"], best["tp1"], best["sl1"], best["rr1"], best["rr2"]
+    )
     embed = build_embed(best)
     view  = SignalActionView(best)
     await interaction.followup.send(embed=embed, view=view, file=discord.File(path))
 
-# ==================================================
-# HELPER: scan all pairs
-# ==================================================
-async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: str):
+
+async def scan_all_pairs_and_send(interaction, timeframe):
     sem = _get_tv_semaphore()
 
     async def _safe_signal(pair):
@@ -2035,9 +1784,10 @@ async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: s
             lines.append(f"⚠️ **{pair}** error: {err}")
         else:
             emoji = "🟢" if d["action"] == "BUY" else "🔴"
+            reg_emoji = d["regime"]["emoji"] if "regime" in d else ""
             lines.append(
-                f"{emoji} **{pair}** | Score: `{d['score']}%` | {d['confidence']}"
-                f" | Entry: `{d['entry']:.4f}`"
+                f"{emoji} **{pair}** | Score: `{d['score']:.1f}%` | {d['confidence']}"
+                f" | Entry: `{d['entry']:.4f}` {reg_emoji}"
             )
 
     embed = discord.Embed(
@@ -2047,6 +1797,7 @@ async def scan_all_pairs_and_send(interaction: discord.Interaction, timeframe: s
     )
     embed.set_footer(text="Klik '📈 Signal per Pair' untuk detail sinyal per pair")
     await interaction.followup.send(embed=embed)
+
 
 # ==================================================
 # SLASH COMMANDS
@@ -2059,12 +1810,13 @@ async def menu(interaction: discord.Interaction):
         description = "Pilih aksi yang ingin kamu lakukan:",
         color       = discord.Color.gold(),
     )
-    embed.add_field(name="🏆 Best Signal",       value="Sinyal terbaik dari semua pair",          inline=False)
-    embed.add_field(name="📈 Signal per Pair",   value="Sinyal spesifik untuk satu pair",         inline=False)
-    embed.add_field(name="📊 Chart per Pair",    value="Candle chart tanpa sinyal",                inline=False)
-    embed.add_field(name="🔁 Scan Semua Pair",   value="Ringkasan cepat semua pair",              inline=False)
+    embed.add_field(name="🏆 Best Signal",        value="Sinyal terbaik dari semua pair",         inline=False)
+    embed.add_field(name="📈 Signal per Pair",    value="Sinyal spesifik untuk satu pair",        inline=False)
+    embed.add_field(name="📊 Chart per Pair",     value="Candle chart tanpa sinyal",              inline=False)
+    embed.add_field(name="🔁 Scan Semua Pair",    value="Ringkasan cepat semua pair",             inline=False)
     embed.add_field(name="⚙️ Auto Signal Toggle", value="Aktifkan/matikan auto-signal otomatis",  inline=False)
     await interaction.response.send_message(embed=embed, view=MainMenuView())
+
 
 @client.tree.command(name="signal", description="Best AI signal dari semua pair")
 @app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
@@ -2075,8 +1827,9 @@ async def signal_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_
         )
         return
     await interaction.response.defer()
-    await interaction.followup.send(f"⏳ Scanning semua pair `{timeframe.upper()}`...", ephemeral=False)
+    await interaction.followup.send(f"⏳ Scanning semua pair `{timeframe.upper()}`...")
     await scan_best_and_send(interaction, timeframe)
+
 
 @client.tree.command(name="pair", description="Sinyal AI untuk pair tertentu")
 @app_commands.describe(pair="Contoh: BTCUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
@@ -2095,6 +1848,7 @@ async def pair_cmd(interaction: discord.Interaction, pair: str, timeframe: str =
     await interaction.response.defer()
     await send_signal_or_chart(interaction, pair, timeframe, mode="signal")
 
+
 @client.tree.command(name="chart", description="Candle chart pair tertentu")
 @app_commands.describe(pair="Contoh: ETHUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
 async def chart_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
@@ -2107,12 +1861,14 @@ async def chart_cmd(interaction: discord.Interaction, pair: str, timeframe: str 
     await interaction.response.defer()
     await send_signal_or_chart(interaction, pair, timeframe, mode="chart")
 
+
 @client.tree.command(name="scanall", description="Scan semua pair sekaligus")
 @app_commands.describe(timeframe="Timeframe: 5m / 15m / 1h / 4h")
 async def scanall_cmd(interaction: discord.Interaction, timeframe: str = DEFAULT_TF):
     await interaction.response.defer()
     await interaction.followup.send(f"⏳ Scanning semua pair `{timeframe.upper()}`...")
     await scan_all_pairs_and_send(interaction, timeframe)
+
 
 @client.tree.command(name="auto", description="Toggle auto signal (on/off)")
 async def auto_cmd(interaction: discord.Interaction):
@@ -2121,9 +1877,9 @@ async def auto_cmd(interaction: discord.Interaction):
     status = "🟢 AKTIF" if AUTO_SIGNAL else "🔴 MATI"
     await interaction.response.send_message(f"Auto Signal: **{status}**")
 
+
 @client.tree.command(name="divstatus", description="Lihat status RSI Divergence tracker")
 async def divstatus_cmd(interaction: discord.Interaction):
-    """Tampilkan cooldown status tiap pair."""
     now   = time.time()
     lines = []
     for pair in PAIRS:
@@ -2149,29 +1905,204 @@ async def divstatus_cmd(interaction: discord.Interaction):
     embed.set_footer(text=f"Cooldown: {DIV_COOLDOWN//60} menit per pair | Scan setiap 5 menit")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
 @client.tree.command(name="datasource", description="Cek status data source (TradingView / Yahoo)")
 async def datasource_cmd(interaction: discord.Interaction):
     _check_tv_available()
     source     = "🟢 **TradingView WebSocket** (native)" if _tv_ok else "🟡 **Yahoo Finance** (fallback)"
     cache_info = f"Cache entries: `{len(_data_cache)}` | TTL: `{CACHE_TTL}s`"
-    await interaction.response.send_message(
-        f"**Data Source:** {source}\n{cache_info}", ephemeral=True
+    await interaction.response.send_message(f"**Data Source:** {source}\n{cache_info}", ephemeral=True)
+
+
+# ==================================================
+# [NEW] /dbstats
+# ==================================================
+@client.tree.command(name="dbstats", description="Statistik database & ML model")
+async def dbstats_cmd(interaction: discord.Interaction):
+    """Tampilkan statistik database dan status ML model."""
+    await interaction.response.defer(ephemeral=True)  # ← pakai defer biar tidak timeout
+    
+    try:
+        # Coba ambil statistik dari DB
+        stats = get_db_stats()
+        win_rate = get_win_rate()
+        ml_stat = ml_status()
+        
+        embed = discord.Embed(
+            title="📊 Database & ML Stats", 
+            color=discord.Color.blurple()
+        )
+        
+        # Cek apakah stats berhasil diambil
+        if stats:
+            embed.add_field(
+                name="🗃 Database",
+                value=(
+                    f"Signals logged: `{stats.get('signals', 0)}`\n"
+                    f"Div alerts:     `{stats.get('div_alerts', 0)}`\n"
+                    f"Score history:  `{stats.get('score_history', 0)}`\n"
+                    f"Outcomes:       `{stats.get('outcomes', 0)}`"
+                ),
+                inline=True,
+            )
+        else:
+            embed.add_field(name="🗃 Database", value="❌ Gagal mengambil statistik", inline=True)
+        
+        # Win rate
+        if win_rate and win_rate.get('total', 0) > 0:
+            embed.add_field(
+                name="🏆 Win Rate (from outcomes)",
+                value=(
+                    f"Total trades:  `{win_rate['total']}`\n"
+                    f"Wins:          `{win_rate['wins']}`\n"
+                    f"Losses:        `{win_rate['losses']}`\n"
+                    f"Win rate:      `{win_rate['win_rate']}%`"
+                ),
+                inline=True,
+            )
+        else:
+            embed.add_field(name="🏆 Win Rate", value="⏳ Belum ada data outcome", inline=True)
+        
+        # ML Status
+        embed.add_field(name="🤖 ML Model", value=ml_stat or "⏳ Belum siap", inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        # Tangkap error dan kirim pesan yang jelas
+        error_msg = f"❌ Error: `{str(e)}`"
+        print(f"[DBSTATS ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(error_msg, ephemeral=True)
+
+# ==================================================
+# [NEW] /outcome
+# ==================================================
+@client.tree.command(name="outcome", description="Catat hasil trade (TP/SL hit)")
+@app_commands.describe(
+    pair       = "Pair, e.g. BTCUSD",
+    timeframe  = "Timeframe: 5m / 15m / 1h / 4h",
+    outcome    = "Hasil: TP1 / TP2 / SL1 / SL2 / MANUAL_CLOSE",
+    entry      = "Harga entry",
+    exit_price = "Harga exit aktual",
+)
+async def outcome_cmd(
+    interaction: discord.Interaction,
+    pair: str,
+    timeframe: str,
+    outcome: str,
+    entry: float,
+    exit_price: float,
+):
+    pair    = pair.upper()
+    outcome = outcome.upper()
+
+    valid_outcomes = {"TP1", "TP2", "SL1", "SL2", "MANUAL_CLOSE"}
+    if outcome not in valid_outcomes:
+        await interaction.response.send_message(
+            f"❌ Outcome tidak valid. Pilih: {', '.join(valid_outcomes)}", ephemeral=True
+        )
+        return
+
+    pips_result = exit_price - entry
+    recent      = get_recent_signals(pair, limit=5)
+    rr_achieved = 0.0
+    sl_used     = None
+    if recent:
+        last    = recent[0]
+        sl_used = last.get("sl2")
+        if sl_used and abs(entry - sl_used) > 0:
+            rr_achieved = abs(exit_price - entry) / abs(entry - sl_used)
+
+    log_outcome(
+        signal_id   = recent[0]["id"] if recent else 0,
+        pair        = pair,
+        timeframe   = timeframe,
+        action      = "BUY" if pips_result > 0 else "SELL",
+        entry       = entry,
+        tp1         = recent[0].get("tp1", 0) if recent else 0,
+        tp2         = recent[0].get("tp2", 0) if recent else 0,
+        sl1         = recent[0].get("sl1", 0) if recent else 0,
+        sl2         = recent[0].get("sl2", 0) if recent else 0,
+        outcome     = outcome,
+        pips_result = pips_result,
+        rr_achieved = round(rr_achieved, 2),
     )
+
+    # Trigger background retrain
+    def _bg_train():
+        rows = get_training_data()
+        if len(rows) >= int(os.getenv("ML_MIN_ROWS", "150")):
+            train(rows)
+    threading.Thread(target=_bg_train, daemon=True).start()
+
+    emoji = "✅" if outcome in ("TP1", "TP2") else "❌"
+    await interaction.response.send_message(
+        f"{emoji} Outcome dicatat!\n"
+        f"**{pair}** `{timeframe}` | {outcome} | "
+        f"PnL: `{pips_result:+.4f}` | RR: `1:{rr_achieved:.2f}`\n"
+        f"*(ML model akan retrain otomatis setelah {int(os.getenv('ML_MIN_ROWS','150'))} outcomes)*",
+        ephemeral=True,
+    )
+
+
+# ==================================================
+# [NEW] /regime
+# ==================================================
+@client.tree.command(name="regime", description="Cek market regime pair saat ini")
+@app_commands.describe(pair="Contoh: BTCUSD", timeframe="Timeframe: 5m / 15m / 1h / 4h")
+async def regime_cmd(interaction: discord.Interaction, pair: str, timeframe: str = DEFAULT_TF):
+    pair = pair.upper()
+    if pair not in PAIRS:
+        await interaction.response.send_message("❌ Pair tidak valid", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        df     = await run_blocking(get_data, pair, timeframe)
+        regime = detect_regime(df)
+
+        color_map = {
+            "TREND_UP":   discord.Color.green(),
+            "TREND_DOWN": discord.Color.red(),
+            "BREAKOUT":   discord.Color.orange(),
+            "REVERSAL":   discord.Color.purple(),
+            "RANGING":    discord.Color.greyple(),
+            "UNKNOWN":    discord.Color.default(),
+        }
+        embed = discord.Embed(
+            title = f"{regime['emoji']} Market Regime — {pair} {timeframe.upper()}",
+            color = color_map.get(regime["regime"], discord.Color.default()),
+        )
+        embed.add_field(name="📊 Regime Detail", value=regime_embed_value(regime), inline=False)
+        embed.add_field(
+            name  = "🔑 Alasan",
+            value = "\n".join(f"• {r}" for r in regime["reasons"]) or "N/A",
+            inline=False,
+        )
+        embed.add_field(
+            name  = "📐 Modifier",
+            value = (
+                f"BUY signal: `{regime_score_modifier(regime, 'BUY'):+d}` pts\n"
+                f"SELL signal: `{regime_score_modifier(regime, 'SELL'):+d}` pts"
+            ),
+            inline=True,
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: `{e}`")
+
 
 # ==================================================
 # RSI DIVERGENCE NOTIFICATION SYSTEM
 # ==================================================
 
-# State tracker — cegah spam notif pair yang sama
-# format: { "BTCUSD_5m": {"type": "BULLISH_DIV", "last_sent": timestamp} }
 _div_sent: dict = {}
-DIV_COOLDOWN = 3600   # detik — min jarak antar notif pair yang sama (1 jam)
+DIV_COOLDOWN = 3600
+
 
 def _rsi_div_detail(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) -> dict:
-    """
-    Versi extended rsi_divergence — kembalikan detail lengkap
-    untuk embed dan chart annotation.
-    """
     close      = df["Close"]
     price_now  = float(close.iloc[-1])
     price_prev = float(close.iloc[-lookback])
@@ -2183,7 +2114,7 @@ def _rsi_div_detail(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) 
 
     if price_diff < 0 and rsi_diff > 0:
         div_type = "BULLISH_DIV"
-        strength = abs(rsi_diff)   # makin besar makin kuat
+        strength = abs(rsi_diff)
     elif price_diff > 0 and rsi_diff < 0:
         div_type = "BEARISH_DIV"
         strength = abs(rsi_diff)
@@ -2203,6 +2134,7 @@ def _rsi_div_detail(df: pd.DataFrame, rsi_series: pd.Series, lookback: int = 5) 
         "lookback":   lookback,
     }
 
+
 def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> discord.Embed:
     is_bull  = div["type"] == "BULLISH_DIV"
     color    = discord.Color.green() if is_bull else discord.Color.red()
@@ -2214,7 +2146,6 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
     elif strength >= 8:  str_lbl = "MODERATE"
     else:                str_lbl = "WEAK"
 
-    # BOS + candle detail (injected dari check_and_send_div)
     bos    = div.get("bos", {})
     candle = div.get("candle", {})
 
@@ -2229,12 +2160,11 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         title = f"{emoji} RSI {div_name} DIVERGENCE — {pair}  [{timeframe.upper()}]",
         description = (
             f"**Kekuatan:** `{str_lbl}` ({strength:.1f} RSI pts)  |  "
-            f"**AI Score:** `{signal_data['score']}%` — {signal_data['confidence']}"
+            f"**AI Score:** `{signal_data['score']:.1f}%` — {signal_data['confidence']}"
         ),
         color = color,
     )
 
-    # ── Penjelasan divergence ─────────────────────
     arrow_price = "↓" if div["price_diff"] < 0 else "↑"
     arrow_rsi   = "↑" if div["rsi_diff"]   > 0 else "↓"
 
@@ -2252,8 +2182,6 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         )
 
     embed.add_field(name="📊 Analisis Divergence", value=explanation, inline=False)
-
-    # ── RSI data ──────────────────────────────────
     embed.add_field(
         name  = "📈 Data RSI",
         value = (
@@ -2265,7 +2193,6 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         inline=False,
     )
 
-    # ── BOS Konfirmasi ────────────────────────────
     bos_status = "FRESH" if (bos.get("fresh_bull") if is_bull else bos.get("fresh_bear")) else "NOT CONFIRMED"
     embed.add_field(
         name  = "🏗 BOS Konfirmasi",
@@ -2277,7 +2204,6 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         inline=True,
     )
 
-    # ── Candle Konfirmasi ─────────────────────────
     candle_status = "CONFIRMED" if candle_ok else "NOT CONFIRMED"
     embed.add_field(
         name  = "🕯 Candle Konfirmasi",
@@ -2290,7 +2216,6 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         inline=True,
     )
 
-    # ── Level Trading ─────────────────────────────
     sw = signal_data["sweep"]
     embed.add_field(
         name  = "📍 Level Trading",
@@ -2305,14 +2230,14 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         inline=True,
     )
 
-    # ── Konfirmasi tambahan ────────────────────────
     embed.add_field(
         name  = "🧠 Konfirmasi Lain",
         value = (
             f"MTF Bias: `{signal_data['mtf']['bias']}`\n"
             f"Orderflow: `{signal_data['orderflow']['bias']}`\n"
             f"FVG: `{'IN BULL FVG' if signal_data['fvg']['in_bull_fvg'] else 'IN BEAR FVG' if signal_data['fvg']['in_bear_fvg'] else 'Outside'}`\n"
-            f"Session: `{signal_data['session']['session']}` {signal_data['session']['utc_time']}"
+            f"Session: `{signal_data['session']['session']}` {signal_data['session']['utc_time']}\n"
+            f"Regime: `{signal_data.get('regime', {}).get('regime', 'N/A')}`"
         ),
         inline=True,
     )
@@ -2322,26 +2247,11 @@ def build_div_embed(pair: str, timeframe: str, div: dict, signal_data: dict) -> 
         value = "RSI Divergence adalah sinyal probabilistik. Selalu gunakan manajemen risiko.",
         inline=False,
     )
-
-    embed.set_footer(
-        text=f"RSI Div Alert | TF: {timeframe.upper()} | Filter: BOS+Candle+Score>=65 | AI Engine v3"
-    )
+    embed.set_footer(text=f"RSI Div Alert | TF: {timeframe.upper()} | Filter: BOS+Candle+Score>=65 | AI Engine v4")
     return embed
 
-def lookback_label(n: int) -> str:
-    return f"{n} candle"
 
-def create_div_chart(
-    df: pd.DataFrame,
-    pair: str,
-    timeframe: str,
-    div: dict,
-    signal_data: dict,
-) -> str:
-    """
-    Chart khusus divergence — tampilkan candle + RSI panel bawah
-    dengan garis divergence yang jelas.
-    """
+def create_div_chart(df, pair, timeframe, div, signal_data) -> str:
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     from matplotlib.lines import Line2D
@@ -2377,16 +2287,14 @@ def create_div_chart(
     sl1      = signal_data["sl1"]
     sl2      = signal_data["sl2"]
 
-    # ── Figure: candle (3) + RSI (1.2) ───────────
     fig = plt.figure(figsize=(18, 11), facecolor="#0d1117")
     gs  = GridSpec(2, 1, figure=fig, height_ratios=[3, 1.2],
                    hspace=0.04, left=0.01, right=0.85, top=0.93, bottom=0.07)
-    ax_c = fig.add_subplot(gs[0])   # candle
-    ax_r = fig.add_subplot(gs[1])   # RSI
+    ax_c = fig.add_subplot(gs[0])
+    ax_r = fig.add_subplot(gs[1])
     ax_c.set_facecolor("#0d1117")
     ax_r.set_facecolor("#0d1117")
 
-    # ── TP/SL zones ──────────────────────────────
     if is_buy:
         ax_c.axhspan(entry, tp2, alpha=0.07, color="#00c853", zorder=1)
         ax_c.axhspan(entry, tp1, alpha=0.13, color="#69f0ae", zorder=1)
@@ -2398,7 +2306,6 @@ def create_div_chart(
         ax_c.axhspan(entry, sl2, alpha=0.08, color="#d50000", zorder=1)
         if sl1: ax_c.axhspan(entry, sl1, alpha=0.13, color="#ff6d00", zorder=1)
 
-    # ── Candles ───────────────────────────────────
     w = 0.6
     for i, x in enumerate(xs):
         o, h, l, c = opens[i], highs[i], lows[i], closes[i]
@@ -2413,50 +2320,39 @@ def create_div_chart(
         )
         ax_c.add_patch(rect)
 
-    # ── EMA ──────────────────────────────────────
     ax_c.plot(xs, df_c["EMA8"].values,  color="#00e5ff", lw=0.9, label="EMA 8",  zorder=8)
     ax_c.plot(xs, df_c["EMA21"].values, color="#ffeb3b", lw=0.9, label="EMA 21", zorder=8)
     ax_c.plot(xs, df_c["EMA50"].values, color="#ff9800", lw=1.1, label="EMA 50", zorder=8)
 
-    # ── TP/SL lines ───────────────────────────────
     lx = xs[-1] + 0.5
     ax_c.axhline(tp2,   color="#00e676", lw=1.5, linestyle="--", zorder=9)
     ax_c.text(lx, tp2,  f" TP2 {tp2:.4f}", color="#00e676",  fontsize=7.5, va="center", fontweight="bold")
     ax_c.axhline(tp1,   color="#b9f6ca", lw=1.2, linestyle="-.", zorder=9)
     ax_c.text(lx, tp1,  f" TP1 {tp1:.4f}", color="#b9f6ca",  fontsize=7.5, va="center", fontweight="bold")
     ax_c.axhline(entry, color="#ffffff", lw=1.0, linestyle="--", zorder=9, alpha=0.85)
-    ax_c.text(lx, entry,f" ENTRY {entry:.4f}",  color="#ffffff",  fontsize=7.5, va="center", fontweight="bold")
+    ax_c.text(lx, entry,f" ENTRY {entry:.4f}", color="#ffffff", fontsize=7.5, va="center", fontweight="bold")
     ax_c.axhline(sl2,   color="#ff1744", lw=1.5, linestyle="--", zorder=9)
     ax_c.text(lx, sl2,  f" SL2 {sl2:.4f}", color="#ff1744",  fontsize=7.5, va="center", fontweight="bold")
     if sl1:
         ax_c.axhline(sl1, color="#ffab40", lw=1.2, linestyle="-.", zorder=9)
         ax_c.text(lx, sl1, f" SL1 {sl1:.4f}", color="#ffab40", fontsize=7.5, va="center", fontweight="bold")
 
-    # ── Divergence annotation on price ───────────
-    lookback = div["lookback"]
-    x_prev   = xs[-lookback]
-    x_now    = xs[-1]
-    y_prev   = div["price_prev"]
-    y_now    = div["price_now"]
+    lookback  = div["lookback"]
+    x_prev    = xs[-lookback]
+    x_now     = xs[-1]
+    y_prev    = div["price_prev"]
+    y_now     = div["price_now"]
     div_color = "#00e676" if is_bull else "#ff1744"
 
-    # circle markers di titik divergence
-    ax_c.scatter([x_prev, x_now], [y_prev, y_now],
-                 color=div_color, s=60, zorder=10, edgecolors="white", linewidths=0.5)
-    # garis divergence
+    ax_c.scatter([x_prev, x_now], [y_prev, y_now], color=div_color, s=60, zorder=10, edgecolors="white", linewidths=0.5)
     ax_c.annotate("", xy=(x_now, y_now), xytext=(x_prev, y_prev),
-                  arrowprops=dict(arrowstyle="->", color=div_color, lw=1.5,
-                                  connectionstyle="arc3,rad=0.1"))
-    # label
+                  arrowprops=dict(arrowstyle="->", color=div_color, lw=1.5, connectionstyle="arc3,rad=0.1"))
     mid_x = (x_prev + x_now) / 2
     mid_y = (y_prev + y_now) / 2
-    ax_c.text(mid_x, mid_y,
-              f" {'BULL DIV' if is_bull else 'BEAR DIV'}",
+    ax_c.text(mid_x, mid_y, f" {'BULL DIV' if is_bull else 'BEAR DIV'}",
               color=div_color, fontsize=9, fontweight="bold",
-              bbox=dict(facecolor="#0d1117", edgecolor=div_color,
-                        boxstyle="round,pad=0.3", alpha=0.85))
+              bbox=dict(facecolor="#0d1117", edgecolor=div_color, boxstyle="round,pad=0.3", alpha=0.85))
 
-    # ── Axes candle ───────────────────────────────
     all_levels = [min(lows), max(highs), tp2, sl2]
     if sl1: all_levels.append(sl1)
     y_lo = min(all_levels); y_hi = max(all_levels)
@@ -2468,38 +2364,24 @@ def create_div_chart(
     ax_c.yaxis.set_tick_params(labelcolor="#aaaaaa", labelsize=7.5)
     ax_c.grid(axis="y", color="#1f2937", lw=0.4)
     for sp in ax_c.spines.values(): sp.set_edgecolor("#1f2937")
-    ax_c.legend(loc="upper left", fontsize=7, facecolor="#161b22",
-                edgecolor="#30363d", labelcolor="#cccccc", ncol=3, framealpha=0.85)
+    ax_c.legend(loc="upper left", fontsize=7, facecolor="#161b22", edgecolor="#30363d", labelcolor="#cccccc", ncol=3, framealpha=0.85)
 
-    # ──────────────────────────────────────────────
-    # RSI PANEL
-    # ──────────────────────────────────────────────
     valid = ~np.isnan(rsi_v)
     ax_r.plot(xs[valid], rsi_v[valid], color="#ce93d8", lw=1.2, label="RSI 14", zorder=5)
-
-    # overbought/oversold zones
     ax_r.axhspan(70, 100, alpha=0.08, color="#ff1744")
     ax_r.axhspan(0,   30, alpha=0.08, color="#00e676")
     ax_r.axhline(70, color="#ff1744", lw=0.6, linestyle=":", alpha=0.7)
     ax_r.axhline(50, color="#ffffff", lw=0.5, linestyle=":", alpha=0.3)
     ax_r.axhline(30, color="#00e676", lw=0.6, linestyle=":", alpha=0.7)
+    ax_r.fill_between(xs[valid], rsi_v[valid], 50, where=rsi_v[valid] > 50, alpha=0.08, color="#00e676")
+    ax_r.fill_between(xs[valid], rsi_v[valid], 50, where=rsi_v[valid] < 50, alpha=0.08, color="#ff1744")
 
-    # RSI current value fill
-    ax_r.fill_between(xs[valid], rsi_v[valid], 50,
-                      where=rsi_v[valid] > 50, alpha=0.08, color="#00e676")
-    ax_r.fill_between(xs[valid], rsi_v[valid], 50,
-                      where=rsi_v[valid] < 50, alpha=0.08, color="#ff1744")
-
-    # ── Divergence annotation on RSI ─────────────
     rsi_prev_val = div["rsi_prev"]
     rsi_now_val  = div["rsi_now"]
-    ax_r.scatter([x_prev, x_now], [rsi_prev_val, rsi_now_val],
-                 color=div_color, s=60, zorder=10, edgecolors="white", linewidths=0.5)
+    ax_r.scatter([x_prev, x_now], [rsi_prev_val, rsi_now_val], color=div_color, s=60, zorder=10, edgecolors="white", linewidths=0.5)
     ax_r.annotate("", xy=(x_now, rsi_now_val), xytext=(x_prev, rsi_prev_val),
-                  arrowprops=dict(arrowstyle="->", color=div_color, lw=1.5,
-                                  connectionstyle="arc3,rad=-0.1"))
-    ax_r.text(x_now + 0.3, rsi_now_val,
-              f" RSI {rsi_now_val:.1f}", color="#ce93d8", fontsize=7.5, va="center")
+                  arrowprops=dict(arrowstyle="->", color=div_color, lw=1.5, connectionstyle="arc3,rad=-0.1"))
+    ax_r.text(x_now + 0.3, rsi_now_val, f" RSI {rsi_now_val:.1f}", color="#ce93d8", fontsize=7.5, va="center")
 
     ax_r.set_xlim(-1, xs[-1] + 12)
     ax_r.set_ylim(0, 100)
@@ -2516,37 +2398,23 @@ def create_div_chart(
     ax_r.grid(axis="y", color="#1f2937", lw=0.4)
     for sp in ax_r.spines.values(): sp.set_edgecolor("#1f2937")
 
-    # ── Title ─────────────────────────────────────
-    div_lbl   = "BULLISH DIV 🔼" if is_bull else "BEARISH DIV 🔽"
+    div_lbl = "BULLISH DIV 🔼" if is_bull else "BEARISH DIV 🔽"
     fig.suptitle(
-        f"RSI {div_lbl}  ·  {pair}  ·  {timeframe.upper()}  ·  "
-        f"Score {signal_data['score']}%",
+        f"RSI {div_lbl}  ·  {pair}  ·  {timeframe.upper()}  ·  Score {signal_data['score']:.1f}%",
         color=div_color, fontsize=13, fontweight="bold", y=0.97,
     )
-
-    # ── Watermark ─────────────────────────────────
-    ax_c.text(0.5, 0.5, "AI INSTITUTIONAL BOT",
-              transform=ax_c.transAxes, fontsize=28, color="white", alpha=0.03,
-              ha="center", va="center", rotation=30, fontweight="bold")
+    ax_c.text(0.5, 0.5, "AI INSTITUTIONAL BOT", transform=ax_c.transAxes,
+              fontsize=28, color="white", alpha=0.03, ha="center", va="center", rotation=30, fontweight="bold")
 
     filename = f"{pair}_div_chart.png"
     plt.savefig(filename, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return filename
 
+
 async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
-    """
-    Kirim RSI Div alert jika SEMUA filter terpenuhi:
-      1. TF >= 15m (15m, 1h, 4h)
-      2. Divergence terdeteksi (bull/bear)
-      3. BOS terkonfirmasi searah divergence (fresh BOS)
-      4. Candle konfirmasi solid searah reversal
-      5. AI score >= 65
-      6. Cooldown 1 jam per pair per TF
-    """
     global _div_sent
 
-    # ── Filter 1: hanya 15m keatas ───────────────
     if timeframe not in ("15m", "1h", "4h"):
         return
 
@@ -2556,14 +2424,11 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
         df       = data["df"]
         close    = df["Close"]
 
-        # ── Filter 2: divergence harus ada ───────
         if div_type == "NONE":
             return
 
-        # ── Filter 3: BOS konfirmasi ──────────────
         bos = bos_confirmation(df, swing=10)
         if div_type == "BULLISH_DIV":
-            # BOS bullish harus ada (fresh) untuk konfirmasi
             if not bos["fresh_bull"]:
                 print(f"[DIV SKIP] {pair} {timeframe}: BULLISH_DIV tapi no fresh bull BOS")
                 return
@@ -2572,29 +2437,23 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
                 print(f"[DIV SKIP] {pair} {timeframe}: BEARISH_DIV tapi no fresh bear BOS")
                 return
 
-        # ── Filter 4: candle konfirmasi ───────────
         candle = candle_confirmation(df, div_type)
         if not candle["confirmed"]:
             print(f"[DIV SKIP] {pair} {timeframe}: {div_type} candle not confirmed — {candle['desc']}")
             return
 
-        # ── Filter 5: AI score ────────────────────
         if data["score"] < 65:
             print(f"[DIV SKIP] {pair} {timeframe}: score {data['score']} < 65")
             return
 
-        # ── Filter 6: cooldown ────────────────────
         cache_key = f"{pair}_{timeframe}_div"
         now       = time.time()
         last      = _div_sent.get(cache_key, {})
         if last.get("type") == div_type and (now - last.get("ts", 0)) < DIV_COOLDOWN:
             return
 
-        # ── Semua filter lolos → kirim ────────────
         rsi_s   = rsi(close)
         div_det = _rsi_div_detail(df, rsi_s, lookback=5)
-
-        # inject BOS + candle ke div_det untuk embed
         div_det["bos"]    = bos
         div_det["candle"] = candle
 
@@ -2607,30 +2466,32 @@ async def check_and_send_div(channel, pair: str, timeframe: str = DEFAULT_TF):
                 f"{'🔼 BULLISH' if div_type == 'BULLISH_DIV' else '🔽 BEARISH'} | "
                 f"BOS: {'Fresh Bull' if bos['fresh_bull'] else 'Fresh Bear'} | "
                 f"Candle: {candle['candle_type']} | "
-                f"Score: `{data['score']}%` | {data['confidence']}"
+                f"Score: `{data['score']:.1f}%` | {data['confidence']}"
             ),
             embed = embed,
             file  = discord.File(path),
         )
 
+        # [NEW] Log to DB
+        try:
+            log_div_alert(pair, timeframe, div_det, data)
+        except Exception as e:
+            print(f"[DB log_div ERROR] {e}")
+
         _div_sent[cache_key] = {"type": div_type, "ts": now}
-        print(f"[DIV ALERT SENT] {pair} {timeframe} {div_type} score={data['score']}")
+        print(f"[DIV ALERT SENT] {pair} {timeframe} {div_type} score={data['score']:.1f}")
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[DIV CHECK ERROR] {pair} {timeframe}:\n{tb}")
 
+
 async def div_scan_loop():
-    """
-    Scan RSI divergence semua pair — berjalan background.
-    Hanya TF >= 15m (15m, 1h, 4h) sesuai filter.
-    Delay 3 menit setelah startup agar bot stabil dulu.
-    """
     await client.wait_until_ready()
     await asyncio.sleep(180)
 
-    channel  = client.get_channel(CHANNEL_ID)
-    div_tfs  = ["15m", "1h", "4h"]   # 5m excluded — noise terlalu tinggi
+    channel = client.get_channel(CHANNEL_ID)
+    div_tfs = ["15m", "1h", "4h"]
 
     while not client.is_closed():
         try:
@@ -2641,13 +2502,12 @@ async def div_scan_loop():
                         await asyncio.sleep(1)
         except Exception as e:
             print(f"[DIV LOOP ERROR] {e}")
-
         await asyncio.sleep(300)
 
 
 async def auto_signal_loop():
     await client.wait_until_ready()
-    await asyncio.sleep(30)   # tunggu 30 detik setelah ready
+    await asyncio.sleep(30)
 
     channel = client.get_channel(CHANNEL_ID)
 
@@ -2658,9 +2518,8 @@ async def auto_signal_loop():
                     try:
                         data = await run_blocking(generate_signal, pair, DEFAULT_TF)
                         if data["score"] >= AUTO_MIN_SCORE:
-                            path  = await run_blocking(
-                                create_chart,
-                                data["df"], pair, data["entry"],
+                            path = await run_blocking(
+                                create_chart, data["df"], pair, data["entry"],
                                 data["tp"], data["sl"], data["timeframe"],
                                 data["sweep"], data["fvg"],
                                 data["tp1"], data["sl1"], data["rr1"], data["rr2"]
@@ -2670,12 +2529,24 @@ async def auto_signal_loop():
                             await channel.send(embed=embed, view=view, file=discord.File(path))
                     except Exception as e:
                         print(f"AUTO ERROR {pair}: {e}")
-                    await asyncio.sleep(2)   # napas antar pair
-
+                    await asyncio.sleep(2)
             await asyncio.sleep(900)
         except Exception as e:
             print(f"LOOP ERROR: {e}")
             await asyncio.sleep(30)
+
+
+# ==================================================
+# STARTUP HELPER
+# ==================================================
+def _try_load_and_train():
+    """Load saved ML model, then try to retrain from existing DB rows."""
+    load_model()
+    rows = get_training_data()
+    if rows:
+        print(f"[STARTUP] Retrain ML dengan {len(rows)} rows dari DB...")
+        train(rows)
+
 
 # ==================================================
 # READY
@@ -2689,8 +2560,14 @@ async def on_ready():
         print(f"⚠️  Slash sync error: {e}")
 
     _check_tv_available()
+    init_db()             # [NEW] initialise SQLite
+    _try_load_and_train() # [NEW] load ML model + retrain from DB
+
     print(f"✅ AI TRADING BOT READY — {client.user}")
     print(f"   Data source: {'TradingView WS' if _tv_ok else 'Yahoo Finance'}")
+    print(f"   DB: {os.getenv('BOT_DB_PATH', 'trading_bot.db')}")
+    print(f"   ML model: v{_model_meta.get('version', 0)} rows:{_model_meta.get('rows', 0)}")
+
 
 # ==================================================
 # START
@@ -2698,7 +2575,7 @@ async def on_ready():
 async def main():
     async with client:
         client.loop.create_task(auto_signal_loop())
-        client.loop.create_task(div_scan_loop())     # RSI Div scanner
+        client.loop.create_task(div_scan_loop())
         await client.start(TOKEN)
 
 asyncio.run(main())
