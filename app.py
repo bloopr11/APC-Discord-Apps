@@ -23,7 +23,7 @@ from db_logger  import (
 from regime     import detect_regime, regime_score_modifier, should_skip, regime_embed_value
 from ml_scorer  import (
     adaptive_score, maybe_retrain, ml_status, ml_embed_value,
-    train, load_model, _model_meta,
+    train, load_model, _model_meta, ML_MIN_ROWS,
 )
 
 # ==================================================
