@@ -1202,10 +1202,15 @@ def build_embed(data: dict) -> discord.Embed:
 
     # ── SMC / Structure ──────────────────────────
     ema_lbl = "🐂 Bull Stack" if data["ema"]["BULLISH_STACK"] else "🐻 Bear Stack" if data["ema"]["BEARISH_STACK"] else "Mixed"
-     embed.add_field(
+    embed.add_field(
         name  = "🏗 SMC / Structure",
-        value = smc_embed_value(data["smc"]),
-        inline = False,
+        value = (
+            f"{smc_embed_value(data['smc'])}\n"
+            f"EMA: {ema_lbl}\n"
+            f"LSTM: `{data['lstm']}` | Trend: `{'Strong' if tr['trending'] else 'Weak'}`\n"
+            f"Liq Pressure: `{data['liq']['PRESSURE']}`"
+        ),
+        inline=False,
     )
 
     # ── Anti-Sweep SL ─────────────────────────────
