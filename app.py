@@ -21,6 +21,7 @@ from db_logger  import (
     get_training_data,
 )
 from regime     import detect_regime, regime_score_modifier, should_skip, regime_embed_value
+from smc_engine import smc_full, smc_score_modifier, smc_embed_value
 from ml_scorer  import (
     adaptive_score, maybe_retrain, ml_status, ml_embed_value,
     train, load_model, _model_meta, ML_MIN_ROWS,
@@ -812,16 +813,7 @@ def advanced_score(
     elif stoch_k_val > 80:   m -= 4
     cats["MOMENTUM"] = max(-20, min(20, m))
 
-    s = 0
-    if smc_data["BOS"]:          s += 8
-    if smc_data["LIQ"]:          s += 5
-    if smc_data["ORDER_BLOCK"]:  s += 5
-    if smc_data["CHoCH"]:        s -= 10
-    if liq["PRESSURE"] == "BUY": s += 5
-    else:                         s -= 5
-    if fl["FLOW"] == "BUY":      s += 3
-    else:                         s -= 3
-    cats["SMC"] = max(-20, min(20, s))
+    cats["SMC"] = smc_score_modifier(smc_data)
 
     o = 0
     if of["bias"] == "BUY":      o += 8
@@ -971,7 +963,7 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
     vol_ratio_val  = volume_ratio(df)
     rsi_div        = rsi_divergence(df, rsi_series)
     ema_conf       = ema_confluence(df)
-    smc_data       = smc(df)
+    smc_data       = smc_full(df)
     liq            = liquidity(df)
     fl             = flow(df)
     lstm           = lstm_prediction(df)
@@ -1210,15 +1202,10 @@ def build_embed(data: dict) -> discord.Embed:
 
     # ── SMC / Structure ──────────────────────────
     ema_lbl = "🐂 Bull Stack" if data["ema"]["BULLISH_STACK"] else "🐻 Bear Stack" if data["ema"]["BEARISH_STACK"] else "Mixed"
-    embed.add_field(
+     embed.add_field(
         name  = "🏗 SMC / Structure",
-        value = (
-            f"BOS:`{data['smc']['BOS']}` CHoCH:`{data['smc']['CHoCH']}` OB:`{data['smc']['ORDER_BLOCK']}`\n"
-            f"EMA: {ema_lbl}\n"
-            f"LSTM: `{data['lstm']}` | Trend: `{'Strong' if tr['trending'] else 'Weak'}`\n"
-            f"Liq Pressure: `{data['liq']['PRESSURE']}`"
-        ),
-        inline=True,
+        value = smc_embed_value(data["smc"]),
+        inline = False,
     )
 
     # ── Anti-Sweep SL ─────────────────────────────
