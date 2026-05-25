@@ -1979,10 +1979,24 @@ async def dbstats_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: `{e}`", ephemeral=True)
 
 
+async def autocomplete_action(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Dropdown action BUY / SELL."""
+    options = ["BUY", "SELL"]
+    return [
+        app_commands.Choice(name=o, value=o)
+        for o in options
+        if current.upper() in o
+    ]
+ 
+ 
 @client.tree.command(name="outcome", description="Catat hasil trade (TP/SL hit)")
 @app_commands.describe(
     pair       = "Pilih pair",
     timeframe  = "Pilih timeframe",
+    action     = "Pilih arah trade",
     outcome    = "Pilih hasil trade",
     entry      = "Harga entry",
     exit_price = "Harga exit aktual",
@@ -1990,41 +2004,55 @@ async def dbstats_cmd(interaction: discord.Interaction):
 @app_commands.autocomplete(
     pair      = autocomplete_pair,
     timeframe = autocomplete_timeframe,
+    action    = autocomplete_action,
     outcome   = autocomplete_outcome,
 )
 async def outcome_cmd(
     interaction: discord.Interaction,
     pair:        str,
     timeframe:   str,
+    action:      str,           # ← sekarang dari input user, bukan dihitung
     outcome:     str,
     entry:       float,
     exit_price:  float,
 ):
     pair    = pair.upper()
+    action  = action.upper()
     outcome = outcome.upper()
-
+ 
+    # validasi
+    if action not in ("BUY", "SELL"):
+        await interaction.response.send_message(
+            "❌ Action tidak valid. Pilih: BUY / SELL", ephemeral=True
+        )
+        return
+ 
     valid_outcomes = {"TP1", "TP2", "SL1", "SL2", "MANUAL_CLOSE"}
     if outcome not in valid_outcomes:
         await interaction.response.send_message(
             f"❌ Outcome tidak valid. Pilih: {', '.join(valid_outcomes)}", ephemeral=True
         )
         return
-
-    pips_result = exit_price - entry
+ 
+    # hitung pips & RR berdasarkan action user, bukan asumsi
+    if action == "BUY":
+        pips_result = exit_price - entry
+    else:  # SELL
+        pips_result = entry - exit_price
+ 
     recent      = get_recent_signals(pair, limit=5)
     rr_achieved = 0.0
-    sl_used     = None
     if recent:
         last    = recent[0]
         sl_used = last.get("sl2")
         if sl_used and abs(entry - sl_used) > 0:
             rr_achieved = abs(exit_price - entry) / abs(entry - sl_used)
-
+ 
     log_outcome(
         signal_id   = recent[0]["id"] if recent else 0,
         pair        = pair,
         timeframe   = timeframe,
-        action      = "BUY" if pips_result > 0 else "SELL",
+        action      = action,           # ← dari input user
         entry       = entry,
         tp1         = recent[0].get("tp1", 0) if recent else 0,
         tp2         = recent[0].get("tp2", 0) if recent else 0,
@@ -2034,20 +2062,47 @@ async def outcome_cmd(
         pips_result = pips_result,
         rr_achieved = round(rr_achieved, 2),
     )
-
+ 
+    # trigger background retrain
     def _bg_train():
         rows = get_training_data()
         if len(rows) >= int(os.getenv("ML_MIN_ROWS", "150")):
             train(rows)
     threading.Thread(target=_bg_train, daemon=True).start()
-
-    emoji = "✅" if outcome in ("TP1", "TP2") else "❌"
-    await interaction.response.send_message(
-        f"{emoji} Outcome dicatat!\n"
-        f"**{pair}** `{timeframe}` | {outcome} | "
-        f"PnL: `{pips_result:+.4f}` | RR: `1:{rr_achieved:.2f}`",
-        ephemeral=True,
+ 
+    win   = outcome in ("TP1", "TP2")
+    emoji = "✅" if win else "❌"
+    color = discord.Color.green() if win else discord.Color.red()
+ 
+    embed = discord.Embed(
+        title = f"{emoji} Outcome Dicatat — {pair} {timeframe.upper()}",
+        color = color,
     )
+    embed.add_field(
+        name  = "📋 Detail Trade",
+        value = (
+            f"Action:    `{action}`\n"
+            f"Entry:     `{entry:.4f}`\n"
+            f"Exit:      `{exit_price:.4f}`\n"
+            f"Outcome:   `{outcome}`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name  = "📊 Hasil",
+        value = (
+            f"PnL:  `{pips_result:+.4f}`\n"
+            f"RR:   `1:{rr_achieved:.2f}`\n"
+            f"{'🏆 Win — data ML diupdate' if win else '📉 Loss — data ML diupdate'}"
+        ),
+        inline=True,
+    )
+    embed.set_footer(
+        text=f"ML retrain otomatis setelah {os.getenv('ML_MIN_ROWS','150')} outcomes"
+    )
+ 
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+ 
 
 
 @client.tree.command(name="regime", description="Cek market regime pair saat ini")
