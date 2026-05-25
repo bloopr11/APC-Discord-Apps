@@ -2635,6 +2635,22 @@ def _try_load_and_train():
 # ==================================================
 # START
 # ==================================================
+@client.event
+async def on_ready():
+    try:
+        await client.tree.sync()
+        print("✅ Slash commands synced")
+    except Exception as e:
+        print(f"⚠️  Slash sync error: {e}")
+ 
+    _check_tv_available()
+    init_db()               # koneksi Supabase/SQLite
+    _try_load_and_train()   # load model atau retrain dari DB
+ 
+    print(f"✅ AI TRADING BOT READY — {client.user}")
+    print(f"   Data source: {'TradingView WS' if _tv_ok else 'Yahoo Finance'}")
+    print(f"   DB: {'PostgreSQL' if os.getenv('DATABASE_URL') else 'SQLite'}")
+
 async def main():
     async with client:
         client.loop.create_task(auto_signal_loop())
