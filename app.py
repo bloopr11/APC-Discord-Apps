@@ -2604,34 +2604,33 @@ async def auto_signal_loop():
 # STARTUP HELPER
 # ==================================================
 def _try_load_and_train():
-    """Load saved ML model, then try to retrain from existing DB rows."""
-    load_model()
-    rows = get_training_data()
-    if rows:
-        print(f"[STARTUP] Retrain ML dengan {len(rows)} rows dari DB...")
-        train(rows)
-
-
-# ==================================================
-# READY
-# ==================================================
-@client.event
-async def on_ready():
-    try:
-        await client.tree.sync()
-        print("✅ Slash commands synced")
-    except Exception as e:
-        print(f"⚠️  Slash sync error: {e}")
-
-    _check_tv_available()
-    init_db()             # [NEW] initialise SQLite
-    _try_load_and_train() # [NEW] load ML model + retrain from DB
-
-    print(f"✅ AI TRADING BOT READY — {client.user}")
-    print(f"   Data source: {'TradingView WS' if _tv_ok else 'Yahoo Finance'}")
-    print(f"   DB: {os.getenv('BOT_DB_PATH', 'trading_bot.db')}")
-    print(f"   ML model: v{_model_meta.get('version', 0)} rows:{_model_meta.get('rows', 0)}")
-
+    """
+    Saat startup:
+    1. Coba load model dari disk (ada jika tidak di Railway)
+    2. Jika tidak ada → langsung retrain dari data Supabase/SQLite
+    3. Jika data kurang → log info, bot tetap jalan dengan rule-based
+    """
+    loaded = load_model()
+ 
+    if not loaded:
+        print("[ML] Mencoba retrain dari database...")
+        try:
+            rows = get_training_data()
+            if not rows:
+                print(f"[ML] Belum ada data outcomes di DB — butuh minimal {ML_MIN_ROWS} rows")
+                print("[ML] Bot tetap jalan dengan rule-based scoring")
+                return
+ 
+            print(f"[ML] Ditemukan {len(rows)} rows di DB → mulai training...")
+            success = train(rows)
+            if success:
+                print("[ML] ✅ Model berhasil ditraining dari data DB")
+            else:
+                print(f"[ML] ⚠️  Training gagal — butuh minimal {ML_MIN_ROWS} outcomes dengan label TP/SL")
+                print("[ML] Bot tetap jalan dengan rule-based scoring")
+        except Exception as e:
+            print(f"[ML] Error saat retrain startup: {e}")
+            print("[ML] Bot tetap jalan dengan rule-based scoring")
 
 # ==================================================
 # START
