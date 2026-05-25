@@ -228,7 +228,7 @@ def load_model() -> bool:
               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(_model_meta.get('trained_at', 0)))})")
         return True
     except FileNotFoundError:
-        print(f"[ML] Model file tidak ditemukan ({MODEL_PATH}) — perlu training dulu")
+        print(f"[ML] Model file tidak ditemukan ({MODEL_PATH}) — akan retrain dari DB")
         return False
     except Exception as e:
         print(f"[ML] Gagal load model: {e}")
@@ -367,4 +367,7 @@ def ml_embed_value(ml_result: dict) -> str:
 # ==================================================
 # STARTUP  — coba load model yang sudah ada
 # ==================================================
-load_model()
+# Tidak auto-load di sini — biarkan app.py yang
+# memanggil _try_load_and_train() saat on_ready
+# agar bisa akses DB yang sudah init duluan.
+# load_model() ← HAPUS/COMMENT baris ini
