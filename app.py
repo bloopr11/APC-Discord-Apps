@@ -39,7 +39,6 @@ TV_PASSWORD = os.getenv("TV_PASSWORD", "")
 # ==================================================
 from pairs_config import PAIRS, TIMEFRAMES, MTF_FETCH, ASIA_ACTIVE, DEFAULT_TF
 
-DEFAULT_TF = "15m"
 AUTO_SIGNAL    = False
 AUTO_MIN_SCORE = 75
 
