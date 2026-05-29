@@ -25,7 +25,7 @@ import numpy as np
 from typing import Optional, Tuple
 
 ML_MIN_ROWS      = int(os.getenv("ML_MIN_ROWS",      "10"))
-ML_RETRAIN_EVERY = int(os.getenv("ML_RETRAIN_EVERY", "10"))
+ML_RETRAIN_EVERY = int(os.getenv("ML_RETRAIN_EVERY", "50"))
 MODEL_PATH       = os.getenv("MODEL_PATH", "ml_model.pkl")
 
 # ==================================================

@@ -464,41 +464,48 @@ def get_win_rate(pair: str = None, timeframe: str = None) -> dict:
 
 def get_training_data(min_rows: int = 200) -> list:
     """
-    Ambil data gabungan signals + outcomes untuk ML training.
-    Hanya baris yang sudah ada outcome-nya.
-    
-    [FIX] Menangani perbedaan tipe data:
-    - PostgreSQL: ts (BIGINT) vs created_at (TIMESTAMP) → konversi timestamp ke epoch
-    - SQLite: ts (INTEGER) vs created_at (TEXT) → gunakan strftime
+    Ambil data untuk ML training.
+    JOIN strategy: cari score_history terdekat per pair+timeframe,
+    tidak pakai window timestamp ketat supaya outcome manual tetap match.
     """
     if USE_POSTGRES:
-        # PostgreSQL: konversi TIMESTAMP ke epoch (detik)
         sql = """
             SELECT
-                s.score, s.cat_trend, s.cat_momentum, s.cat_smc,
+                s.score,
+                s.cat_trend, s.cat_momentum, s.cat_smc,
                 s.cat_orderflow, s.cat_fvg, s.cat_mtf, s.cat_session,
                 s.adx, s.rsi, s.vol_ratio, s.action,
                 o.outcome, o.rr_achieved, o.bars_held
-            FROM score_history s
-            JOIN outcomes o ON s.pair = o.pair
-                AND s.timeframe = o.timeframe
-                AND ABS(s.ts - EXTRACT(EPOCH FROM o.created_at)::BIGINT) < 3600
-            ORDER BY s.ts DESC
+            FROM outcomes o
+            JOIN LATERAL (
+                SELECT * FROM score_history s2
+                WHERE s2.pair = o.pair
+                  AND s2.timeframe = o.timeframe
+                ORDER BY s2.ts DESC
+                LIMIT 1
+            ) s ON TRUE
+            WHERE o.outcome IN ('TP1','TP2','SL1','SL2')
+            ORDER BY o.id DESC
             LIMIT %s
         """
     else:
-        # SQLite: strftime('%s', date) → epoch
         sql = """
             SELECT
-                s.score, s.cat_trend, s.cat_momentum, s.cat_smc,
+                s.score,
+                s.cat_trend, s.cat_momentum, s.cat_smc,
                 s.cat_orderflow, s.cat_fvg, s.cat_mtf, s.cat_session,
                 s.adx, s.rsi, s.vol_ratio, s.action,
                 o.outcome, o.rr_achieved, o.bars_held
-            FROM score_history s
-            JOIN outcomes o ON s.pair = o.pair
-                AND s.timeframe = o.timeframe
-                AND ABS(s.ts - CAST(strftime('%%s', o.created_at) AS INTEGER)) < 3600
-            ORDER BY s.ts DESC
+            FROM outcomes o
+            JOIN score_history s ON s.id = (
+                SELECT id FROM score_history s2
+                WHERE s2.pair = o.pair
+                  AND s2.timeframe = o.timeframe
+                ORDER BY s2.ts DESC
+                LIMIT 1
+            )
+            WHERE o.outcome IN ('TP1','TP2','SL1','SL2')
+            ORDER BY o.id DESC
             LIMIT %s
         """
     rows = _execute(sql, (min_rows * 2,), fetch=True) or []
