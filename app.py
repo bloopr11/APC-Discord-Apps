@@ -1494,10 +1494,43 @@ def create_chart(
     return filename
 
 # ==================================================
+# SAFE DISCORD RESPONSE
+# ==================================================
+async def safe_defer(interaction: discord.Interaction, ephemeral=True):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+    except Exception as e:
+        print(f"DEFER ERROR: {e}")
+
+
+async def safe_followup(interaction: discord.Interaction, *args, **kwargs):
+    try:
+        await interaction.followup.send(*args, **kwargs)
+    except Exception as e:
+        print(f"FOLLOWUP ERROR: {e}")
+
+# ==================================================
 # UI VIEWS
 # ==================================================
 
 class PairSelectView(View):
+    
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+    import traceback
+
+    tb = traceback.format_exc()
+    print(f"PAIR VIEW ERROR:\n{tb}")
+
+    try:
+        await safe_followup(
+            interaction,
+            f"❌ Terjadi error: `{error}`",
+            ephemeral=True,
+        )
+    except:
+        pass
+        
     def __init__(self, timeframe: str = DEFAULT_TF, mode: str = "signal"):
         super().__init__(timeout=60)
         self.timeframe = timeframe
@@ -1511,12 +1544,11 @@ class PairSelectView(View):
         select.callback = self.on_pair_select
         self.add_item(select)
 
-    async def on_pair_select(self, interaction: discord.Interaction):
-        pair = interaction.data["values"][0]
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(
-            f"⏳ Memproses `{pair}` `{self.timeframe.upper()}`...",
-            ephemeral=True,
+        await safe_defer(interaction)
+        await safe_followup(
+        interaction,
+        f"⏳ Memproses `{pair}` `{self.timeframe.upper()}`...",
+        ephemeral=True,
         )
         channel = interaction.channel
         try:
@@ -1556,12 +1588,12 @@ class TimeframeSelectView(View):
         select.callback = self.on_tf_select
         self.add_item(select)
 
-    async def on_tf_select(self, interaction: discord.Interaction):
-        tf = interaction.data["values"][0]
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(
-            f"⏳ Memproses `{self.pair}` `{tf.upper()}`...", ephemeral=True
-        )
+    await safe_defer(interaction)
+    await safe_followup(
+    interaction,
+    f"⏳ Memproses `{self.pair}` `{tf.upper()}`...",
+    ephemeral=True,
+    )
 
         channel = (
             interaction.channel
@@ -1593,7 +1625,7 @@ class SignalActionView(View):
 
     @discord.ui.button(label="📊 Candle Chart", style=discord.ButtonStyle.primary)
     async def show_chart(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
+        await safe_defer(interaction, ephemeral=False)
         d = self.data
         try:
             path = await run_blocking(
@@ -1629,8 +1661,10 @@ class SignalActionView(View):
 
     @discord.ui.button(label="🏆 Best Signal Semua Pair", style=discord.ButtonStyle.success)
     async def best_signal(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
-        await interaction.followup.send(f"⏳ Scanning semua pair `{self.data['timeframe'].upper()}`...")
+        await safe_defer(interaction, ephemeral=False)
+        await safe_followup(
+        interaction,
+        f"⏳ Scanning semua pair `{self.data['timeframe'].upper()}`...")
         await scan_best_and_send(interaction, self.data["timeframe"])
 
 class OutcomeMenuView(View):
