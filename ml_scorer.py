@@ -188,28 +188,44 @@ def train(rows: list) -> bool:
             class_weights[label] for label in y
         ])
 
-        # cross-val 5-fold
-        n_splits = min(5, n_loss, n_win)  # fold tidak boleh > minority class
-        n_splits = max(2, n_splits)
+        # cross-val hanya jika data cukup untuk split yang seimbang
+        # minimal tiap fold harus punya kedua class
+        min_class = min(n_win, n_loss)
+        can_crossval = min_class >= 2  # butuh >= 2 minority untuk split aman
 
-        # cross-val manual agar compatible semua versi sklearn
-        from sklearn.model_selection import StratifiedKFold
-        skf       = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_accs   = []
-        for train_idx, val_idx in skf.split(X, y):
-            X_tr, X_val = X[train_idx], X[val_idx]
-            y_tr, y_val = y[train_idx], y[val_idx]
-            sw_tr       = sample_weights[train_idx]
-            clone_pipe  = Pipeline([
-                ("scaler", StandardScaler()),
-                ("clf",    GradientBoostingClassifier(
-                    n_estimators=100, max_depth=3,
-                    learning_rate=0.05, subsample=0.8, random_state=42,
-                )),
-            ])
-            clone_pipe.fit(X_tr, y_tr, clf__sample_weight=sw_tr)
-            cv_accs.append(accuracy_score(y_val, clone_pipe.predict(X_val)))
-        cv_scores = np.array(cv_accs)
+        if can_crossval:
+            from sklearn.model_selection import StratifiedKFold
+            n_splits = min(3, min_class)
+            n_splits = max(2, n_splits)
+            skf      = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            cv_accs  = []
+            for train_idx, val_idx in skf.split(X, y):
+                X_tr, X_val = X[train_idx], X[val_idx]
+                y_tr, y_val = y[train_idx], y[val_idx]
+                sw_tr       = sample_weights[train_idx]
+
+                # skip fold jika training set tidak punya kedua class
+                if len(np.unique(y_tr)) < 2:
+                    continue
+
+                clone_pipe = Pipeline([
+                    ("scaler", StandardScaler()),
+                    ("clf",    GradientBoostingClassifier(
+                        n_estimators=100, max_depth=3,
+                        learning_rate=0.05, subsample=0.8, random_state=42,
+                    )),
+                ])
+                try:
+                    clone_pipe.fit(X_tr, y_tr, clf__sample_weight=sw_tr)
+                    cv_accs.append(accuracy_score(y_val, clone_pipe.predict(X_val)))
+                except Exception:
+                    continue
+
+            cv_scores = np.array(cv_accs) if cv_accs else np.array([0.0])
+        else:
+            # data terlalu sedikit untuk cross-val — skip, langsung fit
+            print(f"[ML] Data terlalu sedikit untuk cross-val ({min_class} minority) → skip CV")
+            cv_scores = np.array([0.0])
 
         # fit final model dengan semua data
         pipe.fit(X, y, clf__sample_weight=sample_weights)
