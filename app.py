@@ -1515,21 +1515,21 @@ async def safe_followup(interaction: discord.Interaction, *args, **kwargs):
 # ==================================================
 
 class PairSelectView(View):
-
+    
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-        import traceback
+    import traceback
 
-        tb = traceback.format_exc()
-        print(f"PAIR VIEW ERROR:\n{tb}")
+    tb = traceback.format_exc()
+    print(f"PAIR VIEW ERROR:\n{tb}")
 
-        try:
-            await safe_followup(
-                interaction,
-                f"❌ Terjadi error: `{error}`",
-                ephemeral=True,
-            )
-        except Exception:
-            pass
+    try:
+        await safe_followup(
+            interaction,
+            f"❌ Terjadi error: `{error}`",
+            ephemeral=True,
+        )
+    except:
+        pass
         
     def __init__(self, timeframe: str = DEFAULT_TF, mode: str = "signal"):
         super().__init__(timeout=60)
