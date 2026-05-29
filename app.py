@@ -186,9 +186,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 _tv_lock       = threading.Lock()
 _tv_last_call  = 0.0
-TV_MIN_INTERVAL = 3.0
+TV_MIN_INTERVAL = 1.0
 
-_tv_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tv_fetch")
+_tv_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="tv_fetch")
 
 def _tv_throttle_sync():
     global _tv_last_call
@@ -211,7 +211,7 @@ def _get_tv_semaphore():
 # IN-MEMORY CACHE
 # ==================================================
 _data_cache: dict = {}
-CACHE_TTL     = 180
+CACHE_TTL     = 300
 CACHE_TTL_HTF = 1800
 
 def _cache_get(cache_key: str, ttl: int):
@@ -1515,21 +1515,21 @@ async def safe_followup(interaction: discord.Interaction, *args, **kwargs):
 # ==================================================
 
 class PairSelectView(View):
-    
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-    import traceback
+        import traceback
 
-    tb = traceback.format_exc()
-    print(f"PAIR VIEW ERROR:\n{tb}")
+        tb = traceback.format_exc()
+        print(f"PAIR VIEW ERROR:\n{tb}")
 
-    try:
-        await safe_followup(
-            interaction,
-            f"❌ Terjadi error: `{error}`",
-            ephemeral=True,
-        )
-    except:
-        pass
+        try:
+            await safe_followup(
+                interaction,
+                f"❌ Terjadi error: `{error}`",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
         
     def __init__(self, timeframe: str = DEFAULT_TF, mode: str = "signal"):
         super().__init__(timeout=60)
@@ -1550,7 +1550,7 @@ class PairSelectView(View):
         f"⏳ Memproses `{pair}` `{self.timeframe.upper()}`...",
         ephemeral=True,
         )
-        channel = interaction.channel
+        channel = interaction.channel or client.get_channel(CHANNEL_ID)
         try:
             data = await run_blocking(generate_signal, pair, self.timeframe)
             if self.mode == "chart":
@@ -2045,7 +2045,7 @@ class TimeframeSelectMenu(View):
         tf = interaction.data["values"][0]
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(f"⏳ Mencari best signal `{tf.upper()}`...", ephemeral=True)
-        channel = interaction.channel
+        channel = interaction.channel or client.get_channel(CHANNEL_ID)
 
         async def _safe(pair):
             try:
