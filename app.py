@@ -1511,7 +1511,7 @@ class PairSelectView(View):
         select.callback = self.on_pair_select
         self.add_item(select)
 
-    aasync def on_pair_select(self, interaction: discord.Interaction):
+    async def on_pair_select(self, interaction: discord.Interaction):
         pair = interaction.data["values"][0]
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(
