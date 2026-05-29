@@ -155,26 +155,47 @@ def train(rows: list) -> bool:
     # ── class balance check ───────────────────────
     n_win  = int(y.sum())
     n_loss = len(y) - n_win
-    if n_win < 10 or n_loss < 10:
-        print(f"[ML] Class imbalance terlalu ekstrim (win={n_win}, loss={n_loss}) → skip")
+    if n_win == 0 or n_loss == 0:
+        print(f"[ML] Semua label sama (win={n_win}, loss={n_loss}) → skip")
         return False
 
+    # Jika imbalance ekstrim, pakai class_weight untuk kompensasi
+    total = n_win + n_loss
+    ratio = max(n_win, n_loss) / total
+    if ratio > 0.95:
+        print(f"[ML] Imbalance terlalu ekstrim ({ratio:.0%}) → skip")
+        return False
+
+    # Hitung class weight untuk handle imbalance
+    weight_win  = total / (2 * n_win)
+    weight_loss = total / (2 * n_loss)
+    class_weights = {1: weight_win, 0: weight_loss}
+    print(f"[ML] Class weights: win={weight_win:.2f} loss={weight_loss:.2f}")
+
     try:
-        # ── Pipeline: scaler + GBM ────────────────
         pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("clf",    GradientBoostingClassifier(
                 n_estimators   = 100,
-                max_depth      = 4,
+                max_depth      = 3,      # lebih kecil → kurang overfit
                 learning_rate  = 0.05,
                 subsample      = 0.8,
                 random_state   = 42,
             )),
         ])
+        # inject class_weight ke sample_weight saat fit
+        sample_weights = np.array([
+            class_weights[label] for label in y
+        ])
 
         # cross-val 5-fold
-        cv_scores = cross_val_score(pipe, X, y, cv=5, scoring="accuracy")
-        pipe.fit(X, y)
+        n_splits  = min(5, n_loss, n_win)  # fold tidak boleh > minority class
+        n_splits  = max(2, n_splits)
+        cv_scores = cross_val_score(
+            pipe, X, y, cv=n_splits, scoring="accuracy",
+            fit_params={"clf__sample_weight": sample_weights}
+        )
+        pipe.fit(X, y, clf__sample_weight=sample_weights)
 
         # feature importance (dari GBM dalam pipeline)
         importances = pipe.named_steps["clf"].feature_importances_
