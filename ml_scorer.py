@@ -162,7 +162,7 @@ def train(rows: list) -> bool:
     # Jika imbalance ekstrim, pakai class_weight untuk kompensasi
     total = n_win + n_loss
     ratio = max(n_win, n_loss) / total
-    if ratio > 0.95:
+    if ratio > 0.97:
         print(f"[ML] Imbalance terlalu ekstrim ({ratio:.0%}) → skip")
         return False
 
@@ -189,12 +189,29 @@ def train(rows: list) -> bool:
         ])
 
         # cross-val 5-fold
-        n_splits  = min(5, n_loss, n_win)  # fold tidak boleh > minority class
-        n_splits  = max(2, n_splits)
-        cv_scores = cross_val_score(
-            pipe, X, y, cv=n_splits, scoring="accuracy",
-            fit_params={"clf__sample_weight": sample_weights}
-        )
+        n_splits = min(5, n_loss, n_win)  # fold tidak boleh > minority class
+        n_splits = max(2, n_splits)
+
+        # cross-val manual agar compatible semua versi sklearn
+        from sklearn.model_selection import StratifiedKFold
+        skf       = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_accs   = []
+        for train_idx, val_idx in skf.split(X, y):
+            X_tr, X_val = X[train_idx], X[val_idx]
+            y_tr, y_val = y[train_idx], y[val_idx]
+            sw_tr       = sample_weights[train_idx]
+            clone_pipe  = Pipeline([
+                ("scaler", StandardScaler()),
+                ("clf",    GradientBoostingClassifier(
+                    n_estimators=100, max_depth=3,
+                    learning_rate=0.05, subsample=0.8, random_state=42,
+                )),
+            ])
+            clone_pipe.fit(X_tr, y_tr, clf__sample_weight=sw_tr)
+            cv_accs.append(accuracy_score(y_val, clone_pipe.predict(X_val)))
+        cv_scores = np.array(cv_accs)
+
+        # fit final model dengan semua data
         pipe.fit(X, y, clf__sample_weight=sample_weights)
 
         # feature importance (dari GBM dalam pipeline)
