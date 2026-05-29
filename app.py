@@ -186,9 +186,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 _tv_lock       = threading.Lock()
 _tv_last_call  = 0.0
-TV_MIN_INTERVAL = 1.0
+TV_MIN_INTERVAL = 3.0
 
-_tv_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="tv_fetch")
+_tv_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tv_fetch")
 
 def _tv_throttle_sync():
     global _tv_last_call
@@ -211,7 +211,7 @@ def _get_tv_semaphore():
 # IN-MEMORY CACHE
 # ==================================================
 _data_cache: dict = {}
-CACHE_TTL     = 300
+CACHE_TTL     = 180
 CACHE_TTL_HTF = 1800
 
 def _cache_get(cache_key: str, ttl: int):
@@ -1494,43 +1494,10 @@ def create_chart(
     return filename
 
 # ==================================================
-# SAFE DISCORD RESPONSE
-# ==================================================
-async def safe_defer(interaction: discord.Interaction, ephemeral=True):
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral)
-    except Exception as e:
-        print(f"DEFER ERROR: {e}")
-
-
-async def safe_followup(interaction: discord.Interaction, *args, **kwargs):
-    try:
-        await interaction.followup.send(*args, **kwargs)
-    except Exception as e:
-        print(f"FOLLOWUP ERROR: {e}")
-
-# ==================================================
 # UI VIEWS
 # ==================================================
 
 class PairSelectView(View):
-    
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-    import traceback
-
-    tb = traceback.format_exc()
-    print(f"PAIR VIEW ERROR:\n{tb}")
-
-    try:
-        await safe_followup(
-            interaction,
-            f"❌ Terjadi error: `{error}`",
-            ephemeral=True,
-        )
-    except:
-        pass
-        
     def __init__(self, timeframe: str = DEFAULT_TF, mode: str = "signal"):
         super().__init__(timeout=60)
         self.timeframe = timeframe
@@ -1544,34 +1511,11 @@ class PairSelectView(View):
         select.callback = self.on_pair_select
         self.add_item(select)
 
-        await safe_defer(interaction)
-        await safe_followup(
-        interaction,
-        f"⏳ Memproses `{pair}` `{self.timeframe.upper()}`...",
-        ephemeral=True,
-        )
-        channel = interaction.channel or client.get_channel(CHANNEL_ID)
-        try:
-            data = await run_blocking(generate_signal, pair, self.timeframe)
-            if self.mode == "chart":
-                path = await run_blocking(
-                    create_chart, data["df"], pair, data["entry"],
-                    data["tp"], data["sl"], data["timeframe"],
-                    data["sweep"], data["fvg"],
-                    data["tp1"], data["sl1"], data["rr1"], data["rr2"]
-                )
-                await channel.send(
-                    f"📊 **{pair}** `{self.timeframe.upper()}` Candle Chart",
-                    file=discord.File(path),
-                )
-            else:
-                embed = build_embed(data)
-                view  = SignalActionView(data)
-                await channel.send(embed=embed, view=view)
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"PAIR SELECT ERROR [{pair}|{self.timeframe}]:\n{tb}")
-            await channel.send(f"❌ Error memproses `{pair}`: `{e}`")
+    async def on_pair_select(self, interaction: discord.Interaction):
+        pair = interaction.data["values"][0]
+        await interaction.response.defer()
+        await send_signal_or_chart(interaction, pair, self.timeframe, self.mode)
+
 
 class TimeframeSelectView(View):
     def __init__(self, pair: str, mode: str = "signal", channel_id: int = None):
@@ -1588,12 +1532,12 @@ class TimeframeSelectView(View):
         select.callback = self.on_tf_select
         self.add_item(select)
 
-    await safe_defer(interaction)
-    await safe_followup(
-    interaction,
-    f"⏳ Memproses `{self.pair}` `{tf.upper()}`...",
-    ephemeral=True,
-    )
+    async def on_tf_select(self, interaction: discord.Interaction):
+        tf = interaction.data["values"][0]
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(
+            f"⏳ Memproses `{self.pair}` `{tf.upper()}`...", ephemeral=True
+        )
 
         channel = (
             interaction.channel
@@ -1625,7 +1569,7 @@ class SignalActionView(View):
 
     @discord.ui.button(label="📊 Candle Chart", style=discord.ButtonStyle.primary)
     async def show_chart(self, interaction: discord.Interaction, button: Button):
-        await safe_defer(interaction, ephemeral=False)
+        await interaction.response.defer()
         d = self.data
         try:
             path = await run_blocking(
@@ -1661,375 +1605,42 @@ class SignalActionView(View):
 
     @discord.ui.button(label="🏆 Best Signal Semua Pair", style=discord.ButtonStyle.success)
     async def best_signal(self, interaction: discord.Interaction, button: Button):
-        await safe_defer(interaction, ephemeral=False)
-        await safe_followup(
-        interaction,
-        f"⏳ Scanning semua pair `{self.data['timeframe'].upper()}`...")
+        await interaction.response.defer()
+        await interaction.followup.send(f"⏳ Scanning semua pair `{self.data['timeframe'].upper()}`...")
         await scan_best_and_send(interaction, self.data["timeframe"])
 
-class OutcomeMenuView(View):
-    """Step 1: pilih pair."""
-    def __init__(self):
-        super().__init__(timeout=60)
-        options = [
-            discord.SelectOption(label=p, description=PAIRS[p]["yf"], emoji="📈")
-            for p in PAIRS
-        ]
-        sel = Select(placeholder="Pilih pair...", options=options)
-        sel.callback = self.on_pair
-        self.add_item(sel)
- 
-    async def on_pair(self, interaction: discord.Interaction):
-        self.pair = interaction.data["values"][0]
-        # Step 2: pilih timeframe
-        view = OutcomeTFView(self.pair)
-        await interaction.response.edit_message(
-            content=f"📋 Outcome — **{self.pair}** | Pilih timeframe:",
-            view=view,
-        )
- 
- 
-class OutcomeTFView(View):
-    """Step 2: pilih timeframe."""
-    def __init__(self, pair: str):
-        super().__init__(timeout=60)
-        self.pair = pair
-        options = [
-            discord.SelectOption(label=tf.upper(), value=tf)
-            for tf in TIMEFRAMES
-        ]
-        sel = Select(placeholder="Pilih timeframe...", options=options)
-        sel.callback = self.on_tf
-        self.add_item(sel)
- 
-    async def on_tf(self, interaction: discord.Interaction):
-        self.tf = interaction.data["values"][0]
-        # Step 3: pilih action
-        view = OutcomeActionView(self.pair, self.tf)
-        await interaction.response.edit_message(
-            content=f"📋 Outcome — **{self.pair}** `{self.tf.upper()}` | Pilih arah trade:",
-            view=view,
-        )
- 
- 
-class OutcomeActionView(View):
-    """Step 3: pilih BUY / SELL."""
-    def __init__(self, pair: str, tf: str):
-        super().__init__(timeout=60)
-        self.pair = pair
-        self.tf   = tf
- 
-    @discord.ui.button(label="🟢 BUY", style=discord.ButtonStyle.success)
-    async def buy(self, interaction: discord.Interaction, button: Button):
-        view = OutcomeResultView(self.pair, self.tf, "BUY")
-        await interaction.response.edit_message(
-            content=f"📋 Outcome — **{self.pair}** `{self.tf.upper()}` `BUY` | Pilih hasil:",
-            view=view,
-        )
- 
-    @discord.ui.button(label="🔴 SELL", style=discord.ButtonStyle.danger)
-    async def sell(self, interaction: discord.Interaction, button: Button):
-        view = OutcomeResultView(self.pair, self.tf, "SELL")
-        await interaction.response.edit_message(
-            content=f"📋 Outcome — **{self.pair}** `{self.tf.upper()}` `SELL` | Pilih hasil:",
-            view=view,
-        )
- 
- 
-class OutcomeResultView(View):
-    """Step 4: pilih TP1/TP2/SL1/SL2/MANUAL_CLOSE."""
-    def __init__(self, pair: str, tf: str, action: str):
-        super().__init__(timeout=60)
-        self.pair   = pair
-        self.tf     = tf
-        self.action = action
-        options = [
-            discord.SelectOption(label="✅ TP1", value="TP1"),
-            discord.SelectOption(label="✅ TP2", value="TP2"),
-            discord.SelectOption(label="❌ SL1", value="SL1"),
-            discord.SelectOption(label="❌ SL2", value="SL2"),
-            discord.SelectOption(label="🔒 MANUAL_CLOSE", value="MANUAL_CLOSE"),
-        ]
-        sel = Select(placeholder="Pilih hasil trade...", options=options)
-        sel.callback = self.on_result
-        self.add_item(sel)
- 
-    async def on_result(self, interaction: discord.Interaction):
-        outcome = interaction.data["values"][0]
-        # Ambil entry & exit dari signal terakhir di DB sebagai referensi
-        recent = get_recent_signals(self.pair, limit=1)
-        entry_ref  = recent[0].get("entry", 0) if recent else 0
-        tp1_ref    = recent[0].get("tp1",   0) if recent else 0
-        tp2_ref    = recent[0].get("tp2",   0) if recent else 0
-        sl1_ref    = recent[0].get("sl1",   0) if recent else 0
-        sl2_ref    = recent[0].get("sl2",   0) if recent else 0
- 
-        # Tentukan exit price otomatis dari level signal terakhir
-        exit_map = {"TP1": tp1_ref, "TP2": tp2_ref,
-                    "SL1": sl1_ref, "SL2": sl2_ref,
-                    "MANUAL_CLOSE": entry_ref}
-        exit_price = exit_map.get(outcome, entry_ref)
- 
-        # Hitung pips
-        if self.action == "BUY":
-            pips_result = exit_price - entry_ref
-        else:
-            pips_result = entry_ref - exit_price
- 
-        rr_achieved = 0.0
-        sl_used = sl2_ref
-        if sl_used and abs(entry_ref - sl_used) > 0:
-            rr_achieved = abs(exit_price - entry_ref) / abs(entry_ref - sl_used)
- 
-        # Log ke DB
-        try:
-            log_outcome(
-                signal_id   = recent[0]["id"] if recent else 0,
-                pair        = self.pair,
-                timeframe   = self.tf,
-                action      = self.action,
-                entry       = entry_ref,
-                tp1         = tp1_ref,
-                tp2         = tp2_ref,
-                sl1         = sl1_ref,
-                sl2         = sl2_ref,
-                outcome     = outcome,
-                pips_result = pips_result,
-                rr_achieved = round(rr_achieved, 2),
-            )
-        except Exception as e:
-            print(f"[OUTCOME LOG ERROR] {e}")
- 
-        # Trigger retrain background
-        def _bg():
-            rows = get_training_data()
-            if len(rows) >= int(os.getenv("ML_MIN_ROWS", "50")):
-                train(rows)
-        threading.Thread(target=_bg, daemon=True).start()
- 
-        win   = outcome in ("TP1", "TP2")
-        emoji = "✅" if win else "❌"
-        color = discord.Color.green() if win else discord.Color.red()
- 
-        embed = discord.Embed(
-            title = f"{emoji} Outcome Dicatat — {self.pair} {self.tf.upper()}",
-            color = color,
-        )
-        embed.add_field(
-            name  = "📋 Detail",
-            value = (
-                f"Action:  `{self.action}`\n"
-                f"Entry:   `{entry_ref:.4f}`\n"
-                f"Exit:    `{exit_price:.4f}`\n"
-                f"Outcome: `{outcome}`"
-            ),
-            inline=True,
-        )
-        embed.add_field(
-            name  = "📊 Hasil",
-            value = (
-                f"PnL: `{pips_result:+.4f}`\n"
-                f"RR:  `1:{rr_achieved:.2f}`\n"
-                f"{'🏆 Win' if win else '📉 Loss'}"
-            ),
-            inline=True,
-        )
-        embed.set_footer(text="Data tersimpan — ML akan retrain otomatis")
-        await interaction.response.edit_message(content=None, embed=embed, view=None)
-
-class RegimeMenuView(View):
-    """Pilih pair untuk cek regime."""
-    def __init__(self):
-        super().__init__(timeout=60)
-        options = [
-            discord.SelectOption(label=p, description=PAIRS[p]["yf"], emoji="📈")
-            for p in PAIRS
-        ]
-        sel = Select(placeholder="Pilih pair...", options=options)
-        sel.callback = self.on_pair
-        self.add_item(sel)
- 
-    async def on_pair(self, interaction: discord.Interaction):
-        pair = interaction.data["values"][0]
-        # pilih timeframe
-        view = RegimeTFView(pair)
-        await interaction.response.edit_message(
-            content=f"🔍 Regime — **{pair}** | Pilih timeframe:",
-            view=view,
-        )
- 
- 
-class RegimeTFView(View):
-    """Pilih timeframe untuk cek regime."""
-    def __init__(self, pair: str):
-        super().__init__(timeout=60)
-        self.pair = pair
-        options = [
-            discord.SelectOption(label=tf.upper(), value=tf)
-            for tf in TIMEFRAMES
-        ]
-        sel = Select(placeholder="Pilih timeframe...", options=options)
-        sel.callback = self.on_tf
-        self.add_item(sel)
- 
-    async def on_tf(self, interaction: discord.Interaction):
-        tf   = interaction.data["values"][0]
-        pair = self.pair
-        await interaction.response.defer()
-        try:
-            df     = await run_blocking(get_data, pair, tf)
-            regime = detect_regime(df)
- 
-            color_map = {
-                "TREND_UP":   discord.Color.green(),
-                "TREND_DOWN": discord.Color.red(),
-                "BREAKOUT":   discord.Color.orange(),
-                "REVERSAL":   discord.Color.purple(),
-                "RANGING":    discord.Color.greyple(),
-            }
-            embed = discord.Embed(
-                title = f"{regime['emoji']} Market Regime — {pair} {tf.upper()}",
-                color = color_map.get(regime["regime"], discord.Color.default()),
-            )
-            embed.add_field(name="📊 Detail",  value=regime_embed_value(regime), inline=False)
-            embed.add_field(
-                name  = "🔑 Alasan",
-                value = "\n".join(f"• {r}" for r in regime["reasons"]) or "N/A",
-                inline=False,
-            )
-            embed.add_field(
-                name  = "📐 Modifier",
-                value = (
-                    f"BUY:  `{regime_score_modifier(regime, 'BUY'):+d}` pts\n"
-                    f"SELL: `{regime_score_modifier(regime, 'SELL'):+d}` pts"
-                ),
-                inline=True,
-            )
-            await interaction.edit_original_response(content=None, embed=embed, view=None)
-        except Exception as e:
-            await interaction.edit_original_response(content=f"❌ Error: `{e}`", view=None)
 
 class MainMenuView(View):
     def __init__(self):
-        super().__init__(timeout=180)
- 
-    # ── Row 0 ─────────────────────────────────────────────────
+        super().__init__(timeout=120)
+
     @discord.ui.button(label="🏆 Best Signal", style=discord.ButtonStyle.success, row=0)
     async def best_signal(self, interaction: discord.Interaction, button: Button):
         view = TimeframeSelectMenu(mode="best")
-        await interaction.response.send_message(
-            "⏱ Pilih timeframe untuk Best Signal:", view=view, ephemeral=True
-        )
- 
+        await interaction.response.send_message("⏱ Pilih timeframe:", view=view, ephemeral=True)
+
     @discord.ui.button(label="📈 Signal per Pair", style=discord.ButtonStyle.primary, row=0)
     async def signal_pair(self, interaction: discord.Interaction, button: Button):
         view = PairSelectView(mode="signal")
-        await interaction.response.send_message(
-            "📈 Pilih pair:", view=view, ephemeral=True
-        )
- 
+        await interaction.response.send_message("📈 Pilih pair:", view=view, ephemeral=True)
+
     @discord.ui.button(label="📊 Chart per Pair", style=discord.ButtonStyle.primary, row=0)
     async def chart_pair(self, interaction: discord.Interaction, button: Button):
         view = PairSelectView(mode="chart")
-        await interaction.response.send_message(
-            "📊 Pilih pair untuk chart:", view=view, ephemeral=True
-        )
- 
-    # ── Row 1 ─────────────────────────────────────────────────
+        await interaction.response.send_message("📊 Pilih pair untuk chart:", view=view, ephemeral=True)
+
     @discord.ui.button(label="🔁 Scan Semua Pair", style=discord.ButtonStyle.secondary, row=1)
     async def scan_all(self, interaction: discord.Interaction, button: Button):
         await interaction.response.defer()
         await interaction.followup.send("⏳ Scanning semua pair...")
         await scan_all_pairs_and_send(interaction, DEFAULT_TF)
- 
-    @discord.ui.button(label="⚙️ Auto Signal", style=discord.ButtonStyle.danger, row=1)
+
+    @discord.ui.button(label="⚙️ Auto Signal Toggle", style=discord.ButtonStyle.danger, row=1)
     async def toggle_auto(self, interaction: discord.Interaction, button: Button):
         global AUTO_SIGNAL
         AUTO_SIGNAL = not AUTO_SIGNAL
         status = "🟢 AKTIF" if AUTO_SIGNAL else "🔴 MATI"
-        await interaction.response.send_message(
-            f"Auto Signal: **{status}**", ephemeral=True
-        )
- 
-    @discord.ui.button(label="📋 Outcome", style=discord.ButtonStyle.secondary, row=1)
-    async def outcome(self, interaction: discord.Interaction, button: Button):
-        view = OutcomeMenuView()
-        await interaction.response.send_message(
-            "📋 Catat hasil trade — pilih pair:", view=view, ephemeral=True
-        )
- 
-    # ── Row 2 ─────────────────────────────────────────────────
-    @discord.ui.button(label="🔍 Regime", style=discord.ButtonStyle.secondary, row=2)
-    async def regime(self, interaction: discord.Interaction, button: Button):
-        view = RegimeMenuView()
-        await interaction.response.send_message(
-            "🔍 Cek market regime — pilih pair:", view=view, ephemeral=True
-        )
- 
-    @discord.ui.button(label="📡 Div Status", style=discord.ButtonStyle.secondary, row=2)
-    async def div_status(self, interaction: discord.Interaction, button: Button):
-        now   = time.time()
-        lines = []
-        for pair in PAIRS:
-            for tf in ["15m", "1h", "4h"]:
-                key  = f"{pair}_{tf}_div"
-                last = _div_sent.get(key)
-                if last:
-                    elapsed = int(now - last["ts"])
-                    remain  = max(0, DIV_COOLDOWN - elapsed)
-                    emoji   = "🔼" if last["type"] == "BULLISH_DIV" else "🔽"
-                    lines.append(
-                        f"{emoji} **{pair}** `{tf}` — "
-                        f"{elapsed//60}m lalu | sisa {remain//60}m"
-                    )
-        if not lines:
-            lines = ["Belum ada RSI Divergence yang dikirim sejak bot start."]
- 
-        embed = discord.Embed(
-            title       = "📡 RSI Divergence Tracker",
-            description = "\n".join(lines),
-            color       = discord.Color.blurple(),
-        )
-        embed.set_footer(text=f"Cooldown: {DIV_COOLDOWN//60} menit per pair")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
- 
-    @discord.ui.button(label="🗄 DB Stats", style=discord.ButtonStyle.secondary, row=2)
-    async def db_stats(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            stats    = get_db_stats()
-            win_rate = get_win_rate()
-            ml_stat  = ml_status()
- 
-            embed = discord.Embed(title="📊 DB & ML Stats", color=discord.Color.blurple())
-            embed.add_field(
-                name  = "🗃 Database",
-                value = (
-                    f"Signals: `{stats.get('signals', 0)}`\n"
-                    f"Div:     `{stats.get('div_alerts', 0)}`\n"
-                    f"History: `{stats.get('score_history', 0)}`\n"
-                    f"Outcomes:`{stats.get('outcomes', 0)}`"
-                ),
-                inline=True,
-            )
-            if win_rate and win_rate.get("total", 0) > 0:
-                embed.add_field(
-                    name  = "🏆 Win Rate",
-                    value = (
-                        f"Total: `{win_rate['total']}`\n"
-                        f"Win:   `{win_rate['wins']}`\n"
-                        f"Loss:  `{win_rate['losses']}`\n"
-                        f"Rate:  `{win_rate['win_rate']}%`"
-                    ),
-                    inline=True,
-                )
-            else:
-                embed.add_field(name="🏆 Win Rate", value="⏳ Belum ada data", inline=True)
- 
-            embed.add_field(name="🤖 ML", value=ml_stat or "⏳ Belum siap", inline=False)
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: `{e}`", ephemeral=True)
+        await interaction.response.send_message(f"Auto Signal sekarang: **{status}**", ephemeral=True)
 
 
 class TimeframeSelectMenu(View):
@@ -2045,7 +1656,7 @@ class TimeframeSelectMenu(View):
         tf = interaction.data["values"][0]
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(f"⏳ Mencari best signal `{tf.upper()}`...", ephemeral=True)
-        channel = interaction.channel or client.get_channel(CHANNEL_ID)
+        channel = interaction.channel
 
         async def _safe(pair):
             try:
