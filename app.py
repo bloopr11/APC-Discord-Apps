@@ -2057,7 +2057,7 @@ async def outcome_cmd(
     # trigger background retrain
     def _bg_train():
         rows = get_training_data()
-        if len(rows) >= int(os.getenv("ML_MIN_ROWS", "150")):
+        if len(rows) >= int(os.getenv("ML_MIN_ROWS", "10")):
             train(rows)
     threading.Thread(target=_bg_train, daemon=True).start()
  
@@ -2089,7 +2089,7 @@ async def outcome_cmd(
         inline=True,
     )
     embed.set_footer(
-        text=f"ML retrain otomatis setelah {os.getenv('ML_MIN_ROWS','150')} outcomes"
+        text=f"ML retrain otomatis setelah {os.getenv('ML_MIN_ROWS','10')} outcomes"
     )
  
     await interaction.response.send_message(embed=embed, ephemeral=True)
