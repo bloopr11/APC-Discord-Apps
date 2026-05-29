@@ -1066,13 +1066,7 @@ def generate_signal(pair: str, timeframe: str = DEFAULT_TF) -> dict:
         log_signal(result)
         log_score_history(result)
 
-        def _bg_retrain():
-    rows = get_training_data()
-    if rows:
-        maybe_retrain(rows)
-threading.Thread(target=_bg_retrain, daemon=True).start()
-
-rows_snapshot = get_training_data()
+       rows_snapshot = get_training_data()
 if rows_snapshot:
     def _bg_retrain(rows=rows_snapshot):
         maybe_retrain(rows)
