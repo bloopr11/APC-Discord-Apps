@@ -22,6 +22,7 @@ from db_logger  import (
 )
 from regime     import detect_regime, regime_score_modifier, should_skip, regime_embed_value
 from smc_engine import smc_full, smc_score_modifier, smc_embed_value
+from price_alert import price_alert_loop, build_alertstatus_embed
 from ml_scorer  import (
     adaptive_score, maybe_retrain, ml_status, ml_embed_value,
     train, load_model, _model_meta, ML_MIN_ROWS,
@@ -1997,6 +1998,11 @@ class MainMenuView(View):
             f"**Data Source:** {source}\n{cache}", ephemeral=True
         )
 
+    @discord.ui.button(label="🔔 Alert Status", style=discord.ButtonStyle.secondary, row=2)
+    async def alert_status(self, interaction: discord.Interaction, button: Button):
+        from price_alert import build_alertstatus_embed
+        embed = build_alertstatus_embed()
+        await interaction.response.send_message(embed=embed, ephemeral=True)    
 
 class TimeframeSelectMenu(View):
     def __init__(self, mode: str = "best"):
@@ -2497,6 +2503,14 @@ async def regime_cmd(interaction: discord.Interaction, pair: str, timeframe: str
     except Exception as e:
         await interaction.followup.send(f"❌ Error: `{e}`")
 
+# ==================================================
+# Slash command /alertstatus 
+# ==================================================
+ 
+@client.tree.command(name="alertstatus", description="Status price alert semua pair")
+async def alertstatus_cmd(interaction: discord.Interaction):
+    embed = build_alertstatus_embed()
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ==================================================
 # RSI DIVERGENCE NOTIFICATION SYSTEM
@@ -3003,6 +3017,7 @@ async def main():
     async with client:
         client.loop.create_task(auto_signal_loop())
         client.loop.create_task(div_scan_loop())
+        client.loop.create_task(price_alert_loop(client))
         await client.start(TOKEN)
 
 asyncio.run(main())
