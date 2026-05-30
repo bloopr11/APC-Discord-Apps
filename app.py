@@ -3020,4 +3020,18 @@ async def main():
         client.loop.create_task(price_alert_loop(client))
         await client.start(TOKEN)
 
-asyncio.run(main())
+import sys
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "cannot be called from a running event loop" in str(e):
+            # Fallback untuk environment dengan existing event loop (Railway, Jupyter, dll)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(main())
+            else:
+                loop.run_until_complete(main())
+        else:
+            raise
