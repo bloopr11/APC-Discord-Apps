@@ -186,9 +186,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 _tv_lock       = threading.Lock()
 _tv_last_call  = 0.0
-TV_MIN_INTERVAL = 3.0
+TV_MIN_INTERVAL = 1.0
 
-_tv_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tv_fetch")
+_tv_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="tv_fetch")
 
 def _tv_throttle_sync():
     global _tv_last_call
@@ -211,7 +211,7 @@ def _get_tv_semaphore():
 # IN-MEMORY CACHE
 # ==================================================
 _data_cache: dict = {}
-CACHE_TTL     = 180
+CACHE_TTL     = 300
 CACHE_TTL_HTF = 1800
 
 def _cache_get(cache_key: str, ttl: int):
