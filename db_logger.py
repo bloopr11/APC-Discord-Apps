@@ -368,27 +368,63 @@ def log_score_history(data: dict):
 # LOG DIV ALERT
 # ==================================================
 def log_div_alert(pair: str, timeframe: str, div_det: dict, signal_data: dict):
-    bos    = div_det.get("bos", {})
-    candle = div_det.get("candle", {})
-
-    sql = """
-        INSERT INTO div_alerts
-            (ts, pair, timeframe, div_type, strength, score,
-             rsi_now, rsi_prev, price_now, price_prev,
-             bos_fresh, candle_ok)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
-    is_bull  = div_det["type"] == "BULLISH_DIV"
-    params = (
-        int(time.time()),
-        pair, timeframe, div_det["type"],
-        div_det.get("strength"), signal_data.get("score"),
-        div_det.get("rsi_now"), div_det.get("rsi_prev"),
-        div_det.get("price_now"), div_det.get("price_prev"),
-        1 if (bos.get("fresh_bull") if is_bull else bos.get("fresh_bear")) else 0,
-        1 if candle.get("confirmed") else 0,
-    )
-    _execute(sql, params)
+    Simpan RSI divergence alert ke tabel div_alerts.
+    Robust terhadap dict yang tidak lengkap.
+    """
+    try:
+        # ── Ambil data dari div_det dengan fallback ──────────
+        bos    = div_det.get("bos", {}) or {}
+        candle = div_det.get("candle", {}) or {}
+ 
+        div_type   = div_det.get("type", "NONE")
+        strength   = div_det.get("strength", 0.0)
+        rsi_now    = div_det.get("rsi_now",   0.0)
+        rsi_prev   = div_det.get("rsi_prev",  0.0)
+        price_now  = div_det.get("price_now", 0.0)
+        price_prev = div_det.get("price_prev",0.0)
+ 
+        is_bull   = div_type == "BULLISH_DIV"
+        bos_fresh = (
+            bool(bos.get("fresh_bull")) if is_bull
+            else bool(bos.get("fresh_bear"))
+        )
+        candle_ok = bool(candle.get("confirmed", False))
+        score     = int(signal_data.get("score", 0))
+ 
+        sql = """
+            INSERT INTO div_alerts
+                (ts, pair, timeframe, div_type, strength, score,
+                 rsi_now, rsi_prev, price_now, price_prev,
+                 bos_fresh, candle_ok)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """
+        params = (
+    int(time.time()),
+    str(pair),
+    str(timeframe),
+    str(div_type),
+    float(strength),
+    score,
+    float(rsi_now),
+    float(rsi_prev),
+    float(price_now),
+    float(price_prev),
+    bool(bos_fresh),   
+    bool(candle_ok),   
+)
+ 
+        result = _execute(sql, params)
+ 
+        if result is None:
+            print(f"[DB log_div] ⚠️  Insert returned None — {pair} {timeframe} {div_type}")
+        else:
+            print(f"[DB log_div] ✅ Saved — {pair} {timeframe} {div_type} score={score}")
+ 
+    except Exception as e:
+        import traceback
+        print(f"[DB log_div ERROR] {pair} {timeframe}: {e}")
+        traceback.print_exc()
 
 # ==================================================
 # LOG OUTCOME  (call dari webhook / manual command)
